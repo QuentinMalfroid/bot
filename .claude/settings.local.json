@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install -r requirements.txt)",
+      "Bash(timeout 20 python main.py)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(python -m pip install -r requirements.txt)",
+      "Bash(python -m pip install --upgrade \"discord.py-self>=1.10\")",
+      "Bash(timeout 25 python main.py)",
+      "Bash(timeout 30 python main.py)",
+      "Bash(python -c \":*)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \":*)",
+      "Bash(PYTHONIOENCODING=utf-8 python test_parser.py)",
+      "mcp__supabase__get_project_url",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 45 python main.py)"
+    ]
+  }
+}

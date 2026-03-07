@@ -1,0 +1,245 @@
+import re
+import logging
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TradeSignal:
+    trader: Optional[str] = None
+    direction: Optional[str] = None  # LONG / SHORT
+    asset: Optional[str] = None
+    order_type: Optional[str] = None  # MARKET / LIMIT
+    entry_low: Optional[float] = None
+    entry_high: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    risk_pct: Optional[float] = None
+    pnl_pct: Optional[float] = None
+    raw_signal: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+    def is_valid(self):
+        """Un signal est valide s'il a au moins un asset et une direction."""
+        return self.asset is not None and self.direction is not None
+
+
+def parse_message(content: str, author_name: str = "") -> Optional[TradeSignal]:
+    """Tente de parser un message Discord en signal de trade.
+
+    Essaie chaque pattern dans l'ordre. Retourne None si aucun pattern ne matche.
+    """
+    if not content:
+        return None
+
+    for parser_fn in _PARSERS:
+        try:
+            result = parser_fn(content, author_name)
+            if result and result.is_valid():
+                result.raw_signal = content
+                logger.info("Trade parse: %s %s %s", result.direction, result.asset, result.trader)
+                return result
+        except Exception as e:
+            logger.debug("Parser %s echoue: %s", parser_fn.__name__, e)
+
+    return None
+
+
+def _parse_wwg_short_format(content: str, author_name: str) -> Optional[TradeSignal]:
+    """Parse le format court WWG.
+
+    Exemples:
+        @WWG: Woods long eth 1864-1834 stop 1763
+        @WWG: Eliz long wld 399-38 stop 357 pnl: +20%
+    """
+    pattern = r"@WWG:\s*(\w+)\s+(long|short)\s+(\w+)\s+([\d.]+)[-–]([\d.]+)\s+stop\s+([\d.]+)(?:\s+pnl:\s*([+-]?[\d.]+)%)?"
+    match = re.search(pattern, content, re.IGNORECASE)
+    if not match:
+        return None
+
+    trader, direction, asset, price1, price2, stop, pnl = match.groups()
+    p1, p2 = float(price1), float(price2)
+
+    return TradeSignal(
+        trader=trader,
+        direction=direction.upper(),
+        asset=asset.upper(),
+        order_type="LIMIT",
+        entry_low=min(p1, p2),
+        entry_high=max(p1, p2),
+        stop_loss=float(stop),
+        pnl_pct=float(pnl) if pnl else None,
+    )
+
+
+def _parse_structured_format(content: str, author_name: str) -> Optional[TradeSignal]:
+    """Parse le format structure avec separateurs |.
+
+    Exemples:
+        :Long: LIMIT ETH | Entry: 1864 – 1834 | SL: 1763 (< 5.42%)
+        :Short: MARKET BTC | Entry: 65000 | SL: 67000 (< 3.1%)
+    """
+    pattern = (
+        r":(Long|Short):\s*(LIMIT|MARKET)\s+(\w+)"
+        r"\s*\|\s*Entry:\s*([\d.,]+)\s*(?:[-–]\s*([\d.,]+))?"
+        r"\s*\|\s*SL:\s*([\d.,]+)"
+        r"(?:\s*\(<?\s*([\d.]+)%\))?"
+    )
+    match = re.search(pattern, content, re.IGNORECASE)
+    if not match:
+        return None
+
+    direction, order_type, asset, entry1, entry2, sl, risk = match.groups()
+
+    e1 = float(entry1.replace(",", ""))
+    e2 = float(entry2.replace(",", "")) if entry2 else e1
+
+    # Extraire le trader depuis @WWG: Nom en debut de message
+    trader_match = re.search(r"@WWG:\s*(\w+)", content)
+    trader = trader_match.group(1) if trader_match else None
+
+    return TradeSignal(
+        trader=trader,
+        direction=direction.upper(),
+        asset=asset.upper(),
+        order_type=order_type.upper(),
+        entry_low=min(e1, e2),
+        entry_high=max(e1, e2),
+        stop_loss=float(sl.replace(",", "")),
+        risk_pct=float(risk) if risk else None,
+    )
+
+
+def _parse_simple_long_short(content: str, author_name: str) -> Optional[TradeSignal]:
+    """Parse un format plus generique long/short.
+
+    Exemples:
+        long eth 1864-1834 stop 1763
+        short btc 65000 stop 67000
+    """
+    pattern = r"\b(long|short)\s+(\w+)\s+([\d.,]+)(?:\s*[-–]\s*([\d.,]+))?\s+stop\s+([\d.,]+)"
+    match = re.search(pattern, content, re.IGNORECASE)
+    if not match:
+        return None
+
+    direction, asset, price1, price2, stop = match.groups()
+    p1 = float(price1.replace(",", ""))
+    p2 = float(price2.replace(",", "")) if price2 else p1
+
+    return TradeSignal(
+        trader=author_name or None,
+        direction=direction.upper(),
+        asset=asset.upper(),
+        entry_low=min(p1, p2),
+        entry_high=max(p1, p2),
+        stop_loss=float(stop.replace(",", "")),
+    )
+
+
+def _parse_coinbase_format(content: str, author_name: str) -> Optional[TradeSignal]:
+    """Parse le format Coinbase du channel #Coinbase.
+
+    Exemples:
+        🟢 [**BTC-USD**](<url>) Buy Executed - **$28.72K** at **$66063.4**
+        🔴 [**ETH-USD**](<url>) Sell Executed - **$15.5K** at **$3421.2**
+    """
+    pattern = (
+        r"\[\*\*(\w+)-USD\*\*\]"
+        r".*?(Buy|Sell)\s+Executed"
+        r"\s*-\s*\*\*\$([\d.,]+)K?\*\*"
+        r"\s+at\s+\*\*\$([\d.,]+)\*\*"
+    )
+    match = re.search(pattern, content, re.IGNORECASE)
+    if not match:
+        return None
+
+    asset, side, amount_str, price_str = match.groups()
+
+    # Convertir le montant (peut avoir un K pour milliers)
+    amount_str_clean = amount_str.replace(",", "")
+    amount = float(amount_str_clean)
+    if "K" in content[match.start():match.end()+5]:
+        amount *= 1000
+
+    price = float(price_str.replace(",", ""))
+    direction = "LONG" if side.lower() == "buy" else "SHORT"
+
+    return TradeSignal(
+        trader="Coinbase",
+        direction=direction,
+        asset=asset.upper(),
+        order_type="MARKET",
+        entry_low=price,
+        entry_high=price,
+    )
+
+
+def _parse_eth_limit_format(content: str, author_name: str) -> Optional[TradeSignal]:
+    """Parse le format ETH/crypto limit du screenshot.
+
+    Exemples:
+        Eth limit 1864-1834 stop 1763
+        Btc limit 65000-64500 stop 63000
+    """
+    pattern = r"(\w+)\s+limit\s+([\d.,]+)\s*[-–]\s*([\d.,]+)\s+stop\s+([\d.,]+)"
+    match = re.search(pattern, content, re.IGNORECASE)
+    if not match:
+        return None
+
+    asset, price1, price2, stop = match.groups()
+    p1 = float(price1.replace(",", ""))
+    p2 = float(price2.replace(",", ""))
+    sl = float(stop.replace(",", ""))
+
+    # Determiner la direction : si stop < entry => long, sinon short
+    avg_entry = (p1 + p2) / 2
+    direction = "LONG" if sl < avg_entry else "SHORT"
+
+    # Extraire le trader depuis @WWG: Nom
+    trader_match = re.search(r"@WWG:\s*(\w+)", content)
+    trader = trader_match.group(1) if trader_match else author_name or None
+
+    return TradeSignal(
+        trader=trader,
+        direction=direction,
+        asset=asset.upper(),
+        order_type="LIMIT",
+        entry_low=min(p1, p2),
+        entry_high=max(p1, p2),
+        stop_loss=sl,
+    )
+
+
+def parse_embed(embed_data: dict, author_name: str = "") -> Optional[TradeSignal]:
+    """Parse un embed Discord (les bots utilisent souvent des embeds)."""
+    parts = []
+    if embed_data.get("title"):
+        parts.append(embed_data["title"])
+    if embed_data.get("description"):
+        parts.append(embed_data["description"])
+    for field in embed_data.get("fields", []):
+        parts.append(f"{field.get('name', '')}: {field.get('value', '')}")
+
+    combined = " | ".join(parts)
+    return parse_message(combined, author_name)
+
+
+# Liste ordonnee des parsers (du plus specifique au plus generique)
+_PARSERS = [
+    _parse_wwg_short_format,
+    _parse_structured_format,
+    _parse_eth_limit_format,
+    _parse_simple_long_short,
+]
+
+# Parsers secondaires (captures en local mais pas envoyees vers Supabase)
+_PARSERS_LOCAL_ONLY = [
+    _parse_coinbase_format,
+]
+
+# Channels a exclure de l'envoi vers Supabase
+CHANNELS_EXCLUDED_FROM_SUPABASE = {"Coinbase"}
