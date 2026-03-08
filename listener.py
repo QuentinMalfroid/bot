@@ -5,10 +5,12 @@ from pathlib import Path
 import aiohttp
 import discord
 
+import binance_client
 import config
 import database
 import parser as trade_parser
 import supabase_client
+import trade_executor
 
 logger = logging.getLogger(__name__)
 
@@ -142,14 +144,14 @@ class TradeListener(discord.Client):
                 })
 
     async def _process_trade_signal(self, message: discord.Message, channel_name: str):
-        """Parse et insere un nouveau signal de trade."""
+        """Parse et insere un nouveau signal de trade, puis execute sur Binance."""
         trade = trade_parser.parse_message(message.content, message.author.display_name)
         if trade:
             trade_dict = trade.to_dict()
             trade_dict["message_id"] = str(message.id)
             await database.save_parsed_trade(trade_dict)
             if channel_name not in trade_parser.CHANNELS_EXCLUDED_FROM_SUPABASE:
-                await self._push_to_supabase(trade, channel_name, str(message.id))
+                await trade_executor.execute_trade_signal(trade, channel_name, str(message.id))
 
         for embed in message.embeds:
             embed_trade = trade_parser.parse_embed(embed.to_dict(), message.author.display_name)
@@ -158,10 +160,10 @@ class TradeListener(discord.Client):
                 embed_trade_dict["message_id"] = str(message.id)
                 await database.save_parsed_trade(embed_trade_dict)
                 if channel_name not in trade_parser.CHANNELS_EXCLUDED_FROM_SUPABASE:
-                    await self._push_to_supabase(embed_trade, channel_name, str(message.id))
+                    await trade_executor.execute_trade_signal(embed_trade, channel_name, str(message.id))
 
     async def _process_alerts(self, message: discord.Message):
-        """Parse les alertes active-alerts et met a jour les trades dans Supabase."""
+        """Parse les alertes active-alerts, met a jour Supabase et gere les ordres Binance."""
         alerts = trade_parser.parse_alert_message(message.content)
         if not alerts:
             return
@@ -176,7 +178,7 @@ class TradeListener(discord.Client):
 
             side = alert.direction
             if side == "SPOT":
-                side = "LONG"  # Spot = long par defaut
+                side = "LONG"
 
             for trader in alert.traders:
                 existing = await supabase_client.find_open_trade(symbol, trader, side)
@@ -195,18 +197,15 @@ class TradeListener(discord.Client):
                 if alert.close_reason:
                     updates["close_reason"] = alert.close_reason
 
-                # Limit order filled -> ep1_status = filled
                 if alert.event_type == "ep_filled":
                     if existing.get("ep1_status") == "waiting":
                         updates["ep1_status"] = "filled"
                     elif existing.get("ep2_status") == "waiting":
                         updates["ep2_status"] = "filled"
 
-                # Stops moved to BE -> sl_status = closed (SL deplace)
                 if alert.event_type == "sl_to_be":
                     updates["sl_status"] = "closed"
 
-                # Updated Average Entry -> update ep1
                 if alert.new_entry:
                     updates["ep1"] = alert.new_entry
                     updates["ep1_status"] = "filled"
@@ -219,42 +218,8 @@ class TradeListener(discord.Client):
                         {k: v for k, v in updates.items() if k != "updated_at"},
                     )
 
-    async def _push_to_supabase(self, trade: trade_parser.TradeSignal, channel_name: str, message_id: str):
-        """Convertit un TradeSignal en row Supabase et l'insere."""
-        symbol = trade.asset
-        if symbol and not symbol.endswith("USDT"):
-            symbol = f"{symbol}USDT"
-
-        row = {
-            "symbol": symbol,
-            "side": trade.direction,
-            "status": "open",
-            "trader": trade.trader,
-            "source_channel": channel_name,
-            "discord_message_id": message_id,
-            "sl": trade.stop_loss,
-            "sl_status": "waiting" if trade.stop_loss else None,
-        }
-
-        if trade.entry_high is not None:
-            row["ep1"] = trade.entry_high
-            row["ep1_status"] = "waiting"
-
-        if trade.entry_low is not None and trade.entry_low != trade.entry_high:
-            row["ep2"] = trade.entry_low
-            row["ep2_status"] = "waiting"
-
-        if trade.take_profit is not None:
-            row["tp1"] = trade.take_profit
-            row["tp1_status"] = "waiting"
-
-        result = await supabase_client.insert_trade(row)
-        if result:
-            logger.info(
-                "SUPABASE: Trade #%s insere - %s %s %s ep1=%s sl=%s",
-                result.get("id"), symbol, trade.direction, trade.trader,
-                row.get("ep1"), row.get("sl"),
-            )
+            # Execute Binance actions for this alert
+            await trade_executor.handle_alert(alert)
 
     async def _download_image(self, attachment: discord.Attachment, message_id: str) -> Path | None:
         try:
@@ -282,5 +247,6 @@ class TradeListener(discord.Client):
     async def close(self):
         if self._http_session:
             await self._http_session.close()
+        await binance_client.close()
         await supabase_client.close()
         await super().close()

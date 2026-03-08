@@ -30,5 +30,13 @@ ALERTS_THREAD_ID = int(os.getenv("ALERTS_THREAD_ID", "1301074706656530474"))
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
+# Binance
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://demo-api.binance.com")
+
+# Risk management
+TRADE_SIZE_USDT = float(os.getenv("TRADE_SIZE_USDT", "100"))  # USDT per trade
+
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
