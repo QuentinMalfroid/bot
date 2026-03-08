@@ -135,6 +135,27 @@ async def insert_message(msg_data: dict) -> Optional[dict]:
         return None
 
 
+async def get_trades_closed_today(today: str) -> list:
+    """Get trades closed today for daily P&L calculation."""
+    session = await _get_session()
+    url = (
+        f"{_BASE_URL}/trades"
+        f"?status=in.(closed,cancelled)"
+        f"&updated_at=gte.{today}T00:00:00Z"
+        f"&order=updated_at.desc"
+    )
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            else:
+                logger.error("Erreur lecture trades du jour: %s", await resp.text())
+                return []
+    except Exception as e:
+        logger.error("Erreur connexion Supabase (trades du jour): %s", e)
+        return []
+
+
 async def close():
     global _session
     if _session and not _session.closed:

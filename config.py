@@ -36,7 +36,11 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://demo-api.binance.com")
 
 # Risk management
-TRADE_SIZE_USDT = float(os.getenv("TRADE_SIZE_USDT", "100"))  # USDT per trade
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))   # 1R = 1% of account
+MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "3.0"))  # Stop trading after 3% daily loss
+MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "1.5"))              # Minimum reward:risk ratio
+USDT_RESERVE_PCT = float(os.getenv("USDT_RESERVE_PCT", "20.0"))     # Keep 20% USDT untouched
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))  # Reduce to 0.5R after N losses
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

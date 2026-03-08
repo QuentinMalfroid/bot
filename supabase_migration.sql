@@ -97,6 +97,12 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason TEXT
     CHECK (close_reason IN ('profit', 'small_profit', 'loss', 'breakeven', 'stopped_out', 'cancelled') OR close_reason IS NULL);
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
+-- Colonnes risk management
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS risk_usdt NUMERIC;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS r_multiplier NUMERIC DEFAULT 1.0;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS rr_ratio NUMERIC;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC;
+
 -- Index utiles
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);

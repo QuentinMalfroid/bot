@@ -12,7 +12,29 @@
       "Bash(PYTHONIOENCODING=utf-8 python -c \":*)",
       "Bash(PYTHONIOENCODING=utf-8 python test_parser.py)",
       "mcp__supabase__get_project_url",
-      "Bash(PYTHONIOENCODING=utf-8 timeout 45 python main.py)"
+      "Bash(PYTHONIOENCODING=utf-8 timeout 45 python main.py)",
+      "mcp__hostinger-mcp__VPS_getActionDetailsV1",
+      "mcp__hostinger-mcp__VPS_getProjectLogsV1",
+      "mcp__hostinger-mcp__VPS_updateProjectV1",
+      "Bash(PYTHONIOENCODING=utf-8 \"C:/Program Files/Python311/python.exe\" -c \":*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:binance-docs.github.io)",
+      "WebFetch(domain:developers.binance.com)",
+      "WebSearch",
+      "Bash(ls c:/Users/quema/CryptoBot/*.py)",
+      "Bash(gh run list --limit 1 --repo QuentinMalfroid/bot --watch)",
+      "Bash(gh run watch --repo QuentinMalfroid/bot)",
+      "Bash(gh run list --limit 1 --repo QuentinMalfroid/bot)",
+      "mcp__hostinger-mcp__VPS_createNewProjectV1",
+      "Bash(\"C:\\\\Program Files\\\\Python311\\\\python.exe\" -c \"import ast; ast.parse\\(open\\(''risk_manager.py''\\).read\\(\\)\\); print\\(''risk_manager.py OK''\\)\")",
+      "Bash(\"C:\\\\Program Files\\\\Python311\\\\python.exe\" -c \"import ast; ast.parse\\(open\\(''trade_executor.py''\\).read\\(\\)\\); print\\(''trade_executor.py OK''\\)\")",
+      "Bash(\"C:\\\\Program Files\\\\Python311\\\\python.exe\" -c \"import ast; ast.parse\\(open\\(''config.py''\\).read\\(\\)\\); print\\(''config.py OK''\\)\")",
+      "Bash(\"C:\\\\Program Files\\\\Python311\\\\python.exe\" -c \"import ast; ast.parse\\(open\\(''supabase_client.py''\\).read\\(\\)\\); print\\(''supabase_client.py OK''\\)\")",
+      "Bash(curl -s -X POST \"https://dvqbnnvluqoybddlprtq.supabase.co/rest/v1/rpc/exec_sql\" -H \"apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR2cWJubnZsdXFveWJkZGxwcnRxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI4NjkyMTIsImV4cCI6MjA4ODQ0NTIxMn0.dTeW90NhJArNmriKjBwII4rlXRe5uvafGI0SQIZRAdw\" -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR2cWJubnZsdXFveWJkZGxwcnRxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI4NjkyMTIsImV4cCI6MjA4ODQ0NTIxMn0.dTeW90NhJArNmriKjBwII4rlXRe5uvafGI0SQIZRAdw\" -H \"Content-Type: application/json\")",
+      "Bash(python -m json.tool)",
+      "Bash(curl -s \"https://demo-api.binance.com/api/v3/ticker/price?symbol=ETHUSDT\")",
+      "Bash(python -c \"import sys,json; trades=json.load\\(sys.stdin\\); [print\\(f''{t[\"\"id\"\"]}: {t[\"\"symbol\"\"]} {t[\"\"side\"\"]} ep1={t[\"\"ep1\"\"]} sl={t[\"\"sl\"\"]} trader={t[\"\"trader\"\"]}''\\) for t in trades]\")",
+      "Bash(git add config.py risk_manager.py trade_executor.py supabase_client.py supabase_migration.sql .claude/settings.local.json test_parser.py)"
     ]
   }
 }
