@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 import aiohttp
@@ -95,8 +96,14 @@ class TradeListener(discord.Client):
         if after.guild and config.GUILD_IDS and after.guild.id not in config.GUILD_IDS:
             return
 
+        channel_id = after.channel.id
         channel_name = getattr(after.channel, "name", "DM")
         logger.debug("Message edite dans #%s: %s", channel_name, after.content[:100])
+
+        # When WG Bot edits a trades message, check for TP updates in embeds
+        if channel_id == config.TRADES_THREAD_ID and after.embeds:
+            await self._process_tp_update_from_edit(after)
+
         await self._process_message(after)
 
     async def _process_message(self, message: discord.Message):
@@ -253,8 +260,103 @@ class TradeListener(discord.Client):
                         {k: v for k, v in updates.items() if k != "updated_at"},
                     )
 
+                # Fetch TPs from linked trades message if available
+                if alert.linked_message_id and alert.linked_channel_id:
+                    await self._fetch_and_update_tps(
+                        alert.linked_channel_id, alert.linked_message_id,
+                        trade_id, existing,
+                    )
+
             # Execute Binance actions for this alert
             await trade_executor.handle_alert(alert, channel_id=message.channel.id)
+
+    async def _process_tp_update_from_edit(self, message: discord.Message):
+        """When a trades message is edited, check embeds for TP updates."""
+        for embed in message.embeds:
+            embed_dict = embed.to_dict()
+            desc = embed_dict.get("description", "")
+            if not desc:
+                continue
+
+            # Extract direction and asset from embed: ":Long: **BTC** | ..."
+            match = re.search(r":(Long|Short):\s*\*\*(\w+)\*\*", desc)
+            if not match:
+                continue
+
+            direction = match.group(1).upper()
+            asset = match.group(2).upper()
+            symbol = f"{asset}USDT" if not asset.endswith("USDT") else asset
+
+            tp_info = trade_parser.parse_embed_tps(embed_dict)
+            if not tp_info or not tp_info.prices:
+                continue
+
+            # Find the matching open trade in Supabase
+            # Try with common trader names
+            trades = await supabase_client.get_open_trades(symbol)
+            for trade in trades:
+                if trade.get("side") != direction:
+                    continue
+
+                trade_id = trade["id"]
+                tp_updates = {}
+                for i, (price, hit) in enumerate(zip(tp_info.prices, tp_info.hit)):
+                    tp_num = i + 1
+                    if tp_num > 6:
+                        break
+                    tp_key = f"tp{tp_num}"
+                    tp_updates[tp_key] = price
+                    current_status = trade.get(f"{tp_key}_status")
+                    if hit and current_status != "filled":
+                        tp_updates[f"{tp_key}_status"] = "filled"
+                    elif not hit and not current_status:
+                        tp_updates[f"{tp_key}_status"] = "waiting"
+
+                if tp_updates:
+                    await supabase_client.update_trade(trade_id, tp_updates)
+                    logger.info(
+                        "TP_UPDATE: Trade #%s %s updated from edit: %s",
+                        trade_id, symbol, tp_updates,
+                    )
+
+    async def _fetch_and_update_tps(self, channel_id: str, message_id: str,
+                                     trade_id: int, existing: dict):
+        """Fetch linked trades message via Discord API and extract TP levels."""
+        try:
+            channel = self.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.fetch_channel(int(channel_id))
+            if channel is None:
+                return
+
+            # Fetch messages around the target to find it
+            async for msg in channel.history(around=discord.Object(id=int(message_id)), limit=5):
+                if str(msg.id) == message_id:
+                    # Parse TPs from embeds
+                    for embed in msg.embeds:
+                        tp_info = trade_parser.parse_embed_tps(embed.to_dict())
+                        if tp_info and tp_info.prices:
+                            tp_updates = {}
+                            for i, (price, hit) in enumerate(zip(tp_info.prices, tp_info.hit)):
+                                tp_num = i + 1
+                                if tp_num > 6:
+                                    break
+                                tp_key = f"tp{tp_num}"
+                                tp_updates[tp_key] = price
+                                if hit:
+                                    tp_updates[f"{tp_key}_status"] = "filled"
+                                elif not existing.get(f"{tp_key}_status"):
+                                    tp_updates[f"{tp_key}_status"] = "waiting"
+
+                            if tp_updates:
+                                await supabase_client.update_trade(trade_id, tp_updates)
+                                logger.info(
+                                    "ALERT: TPs updated for trade #%s from linked message: %s",
+                                    trade_id, tp_updates,
+                                )
+                    return
+        except Exception as e:
+            logger.warning("ALERT: Could not fetch TPs from message %s: %s", message_id, e)
 
     async def _download_image(self, attachment: discord.Attachment, message_id: str) -> Path | None:
         try:

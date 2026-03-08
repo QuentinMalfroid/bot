@@ -275,9 +275,72 @@ class TradeAlert:
     event_type: Optional[str] = None  # ep_filled / sl_to_be / None
     # For "Updated Average Entry to X"
     new_entry: Optional[float] = None
+    # Link to original trades message (for TP extraction)
+    linked_message_id: Optional[str] = None
+    linked_channel_id: Optional[str] = None
 
     def to_dict(self):
         return asdict(self)
+
+
+@dataclass
+class TPInfo:
+    """Take profit levels parsed from WG Bot embeds."""
+    prices: List[float] = None  # TP prices in order
+    hit: List[bool] = None       # Whether each TP was hit (✓)
+
+    def __post_init__(self):
+        if self.prices is None:
+            self.prices = []
+        if self.hit is None:
+            self.hit = []
+
+
+def parse_embed_tps(embed: dict) -> Optional[TPInfo]:
+    """Extract TP levels from a WG Bot embed description.
+
+    Format: ... | **TPs:** ✓ 64607.6 | ✓ 65634.4 | 68100 | 70473.2
+    ✓ = hit, no ✓ = not yet hit
+    """
+    desc = embed.get("description", "")
+    if not desc:
+        return None
+
+    # Find TPs section
+    tp_match = re.search(r"\*\*TPs?:\*\*\s*(.+)", desc)
+    if not tp_match:
+        return None
+
+    tp_section = tp_match.group(1)
+    prices = []
+    hit = []
+
+    # Split by | and parse each TP
+    for part in tp_section.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        is_hit = "✓" in part or "✅" in part
+        # Extract number
+        num_match = re.search(r"([\d.]+)", part)
+        if num_match:
+            prices.append(float(num_match.group(1)))
+            hit.append(is_hit)
+
+    if prices:
+        return TPInfo(prices=prices, hit=hit)
+    return None
+
+
+def extract_message_link(content: str) -> Optional[tuple]:
+    """Extract Discord message link (guild_id, channel_id, message_id) from content."""
+    match = re.search(
+        r"https://discord\.com/channels/(\d+)/(\d+)/(\d+)",
+        content,
+    )
+    if match:
+        return match.group(1), match.group(2), match.group(3)
+    return None
 
 
 def parse_alert_message(content: str) -> List[TradeAlert]:
@@ -346,6 +409,14 @@ def _parse_single_alert(line: str) -> Optional[TradeAlert]:
         logger.warning("Action non reconnue dans active-alerts: %s", action)
         return None
 
+    # Extract linked message ID from Discord URL in the line
+    linked_msg_id = None
+    linked_ch_id = None
+    link = extract_message_link(line)
+    if link:
+        linked_ch_id = link[1]
+        linked_msg_id = link[2]
+
     return TradeAlert(
         direction=direction.upper(),
         asset=asset.upper(),
@@ -355,4 +426,6 @@ def _parse_single_alert(line: str) -> Optional[TradeAlert]:
         close_reason=close_reason,
         event_type=event_type,
         new_entry=new_entry,
+        linked_message_id=linked_msg_id,
+        linked_channel_id=linked_ch_id,
     )
