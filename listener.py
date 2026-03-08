@@ -23,6 +23,7 @@ class TradeListener(discord.Client):
     def __init__(self):
         super().__init__()
         self._http_session: aiohttp.ClientSession | None = None
+        self._role_map: dict[int, str] = {}  # role_id -> trader name
 
     async def on_ready(self):
         logger.info("Connecte en tant que: %s (ID: %s)", self.user, self.user.id)
@@ -44,6 +45,9 @@ class TradeListener(discord.Client):
                 [(g.name, g.id) for g in self.guilds],
             )
 
+        # Build role map for WWG trader name resolution
+        await self._build_role_map(monitored)
+
         # Join WWG threads so we receive their messages
         await self._join_wwg_threads()
 
@@ -57,6 +61,25 @@ class TradeListener(discord.Client):
         # Start Binance order monitor
         if config.BINANCE_API_KEY:
             asyncio.create_task(order_monitor.start())
+
+    async def _build_role_map(self, guilds: list):
+        """Build a mapping of role IDs to trader names from WWG roles."""
+        for guild in guilds:
+            for role in guild.roles:
+                if role.name.startswith("WWG: "):
+                    trader = role.name.removeprefix("WWG: ").lstrip("-").strip()
+                    self._role_map[role.id] = trader
+        logger.info("Role map built: %d WWG traders", len(self._role_map))
+
+    def _resolve_roles(self, content: str) -> str:
+        """Replace Discord role mentions <@&id> with @WWG: TraderName."""
+        def replacer(match):
+            role_id = int(match.group(1))
+            trader = self._role_map.get(role_id)
+            if trader:
+                return f"@WWG: {trader}"
+            return match.group(0)
+        return re.sub(r"<@&(\d+)>", replacer, content)
 
     async def _join_wwg_threads(self):
         """Join all WWG threads so we receive their messages and edits."""
@@ -183,7 +206,8 @@ class TradeListener(discord.Client):
 
     async def _process_trade_signal(self, message: discord.Message, channel_name: str):
         """Parse et insere un nouveau signal de trade, puis execute sur Binance."""
-        trade = trade_parser.parse_message(message.content, message.author.display_name)
+        content = self._resolve_roles(message.content) if message.content else ""
+        trade = trade_parser.parse_message(content, message.author.display_name)
         if trade:
             trade_dict = trade.to_dict()
             trade_dict["message_id"] = str(message.id)
@@ -206,7 +230,8 @@ class TradeListener(discord.Client):
 
     async def _process_alerts(self, message: discord.Message):
         """Parse les alertes active-alerts, met a jour Supabase et gere les ordres Binance."""
-        alerts = trade_parser.parse_alert_message(message.content)
+        content = self._resolve_roles(message.content) if message.content else ""
+        alerts = trade_parser.parse_alert_message(content)
         if not alerts:
             return
 
@@ -245,8 +270,18 @@ class TradeListener(discord.Client):
                     elif existing.get("ep2_status") == "waiting":
                         updates["ep2_status"] = "filled"
 
-                if alert.event_type == "sl_to_be":
+                if alert.event_type in ("sl_to_be", "sl_moved"):
                     updates["sl_status"] = "closed"
+                    if alert.new_sl_price:
+                        updates["sl"] = alert.new_sl_price
+
+                if alert.event_type == "tp_hit" and alert.tp_level:
+                    tp_key = f"tp{alert.tp_level}_status"
+                    if existing.get(tp_key) is not None or alert.tp_level <= 6:
+                        updates[tp_key] = "filled"
+                    # If TP + stops moved to BE (combined action)
+                    if "stops moved to be" in (alert.action or "").lower():
+                        updates["sl_status"] = "closed"
 
                 if alert.new_entry:
                     updates["ep1"] = alert.new_entry
