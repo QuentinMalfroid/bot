@@ -93,6 +93,26 @@ class TradeListener(discord.Client):
         if not saved:
             return
 
+        # Envoyer le message brut vers Supabase
+        supabase_msg = {
+            "discord_message_id": str(message.id),
+            "guild_id": str(message.guild.id) if message.guild else "0",
+            "guild_name": guild_name,
+            "channel_id": str(channel_id),
+            "channel_name": channel_name,
+            "author_id": str(message.author.id),
+            "author_name": message.author.display_name,
+            "is_bot": message.author.bot,
+            "content": message.content or "",
+            "embeds": [e.to_dict() for e in message.embeds],
+            "attachments": [
+                {"url": a.url, "filename": a.filename, "content_type": a.content_type}
+                for a in message.attachments
+            ],
+            "created_at": message.created_at.isoformat(),
+        }
+        await supabase_client.insert_message(supabase_msg)
+
         logger.debug(
             "[#%s] %s: %s",
             channel_name,

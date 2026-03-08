@@ -114,6 +114,27 @@ async def get_open_trades(symbol: Optional[str] = None) -> list:
         return []
 
 
+async def insert_message(msg_data: dict) -> Optional[dict]:
+    """Insere un message brut dans la table messages Supabase."""
+    session = await _get_session()
+    url = f"{_BASE_URL}/messages"
+
+    try:
+        async with session.post(url, json=msg_data) as resp:
+            if resp.status == 201:
+                result = await resp.json()
+                return result[0] if result else {}
+            elif resp.status == 409:
+                return {}
+            else:
+                error = await resp.text()
+                logger.error("Erreur insertion message Supabase (HTTP %d): %s", resp.status, error)
+                return None
+    except Exception as e:
+        logger.error("Erreur connexion Supabase (message): %s", e)
+        return None
+
+
 async def close():
     global _session
     if _session and not _session.closed:

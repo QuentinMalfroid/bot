@@ -1,3 +1,28 @@
+-- Table des messages bruts Discord
+CREATE TABLE IF NOT EXISTS messages (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    discord_message_id TEXT UNIQUE NOT NULL,
+    guild_id TEXT NOT NULL,
+    guild_name TEXT,
+    channel_id TEXT NOT NULL,
+    channel_name TEXT,
+    author_id TEXT NOT NULL,
+    author_name TEXT,
+    is_bot BOOLEAN DEFAULT FALSE,
+    content TEXT,
+    embeds JSONB DEFAULT '[]',
+    attachments JSONB DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL,
+    captured_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow all for anon" ON messages FOR ALL USING (true) WITH CHECK (true);
+
+CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id);
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_discord_id ON messages(discord_message_id);
+
 -- Table des trades, structure identique au Google Sheet
 CREATE TABLE IF NOT EXISTS trades (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
