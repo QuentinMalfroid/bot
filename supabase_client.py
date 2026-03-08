@@ -74,6 +74,27 @@ async def update_trade(trade_id: int, updates: dict) -> Optional[dict]:
         return None
 
 
+async def find_open_trade(symbol: str, trader: str, side: str) -> Optional[dict]:
+    """Trouve un trade ouvert par symbol, trader et side."""
+    session = await _get_session()
+    url = (
+        f"{_BASE_URL}/trades"
+        f"?symbol=eq.{symbol}&trader=eq.{trader}&side=eq.{side}"
+        f"&status=eq.open&order=created_at.desc&limit=1"
+    )
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                rows = await resp.json()
+                return rows[0] if rows else None
+            else:
+                logger.error("Erreur recherche trade: %s", await resp.text())
+                return None
+    except Exception as e:
+        logger.error("Erreur connexion Supabase: %s", e)
+        return None
+
+
 async def get_open_trades(symbol: Optional[str] = None) -> list:
     """Recupere les trades ouverts, optionnellement filtres par symbol."""
     session = await _get_session()

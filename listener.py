@@ -17,14 +17,12 @@ class TradeListener(discord.Client):
     """Client Discord qui ecoute les messages et les stocke."""
 
     def __init__(self):
-        # Pas d'intents privilegies pour un selfbot, on prend ce qui est dispo
         super().__init__()
         self._http_session: aiohttp.ClientSession | None = None
 
     async def on_ready(self):
         logger.info("Connecte en tant que: %s (ID: %s)", self.user, self.user.id)
 
-        # Lister les serveurs surveilles
         monitored = []
         for guild in self.guilds:
             if not config.GUILD_IDS or guild.id in config.GUILD_IDS:
@@ -42,40 +40,42 @@ class TradeListener(discord.Client):
                 [(g.name, g.id) for g in self.guilds],
             )
 
-        logger.info("Listener pret. Surveillance de %d serveur(s).", len(monitored))
+        logger.info(
+            "Listener pret. Surveillance de %d serveur(s). Threads: trades=%s, alerts=%s",
+            len(monitored), config.TRADES_THREAD_ID, config.ALERTS_THREAD_ID,
+        )
 
     async def on_message(self, message: discord.Message):
-        # Ignorer nos propres messages
         if message.author.id == self.user.id:
             return
 
-        # Filtrer par serveur si des IDs sont configures
         if message.guild and config.GUILD_IDS and message.guild.id not in config.GUILD_IDS:
             return
 
         await self._process_message(message)
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
-        """Capturer les edits (les bots modifient parfois leurs messages)."""
         if after.author.id == self.user.id:
             return
         if after.guild and config.GUILD_IDS and after.guild.id not in config.GUILD_IDS:
             return
 
-        logger.debug("Message edite dans #%s: %s", after.channel.name, after.content[:100])
+        channel_name = getattr(after.channel, "name", "DM")
+        logger.debug("Message edite dans #%s: %s", channel_name, after.content[:100])
         await self._process_message(after)
 
     async def _process_message(self, message: discord.Message):
         """Traite un message : sauvegarde brute + parsing + telechargement images."""
         guild_name = message.guild.name if message.guild else "DM"
         channel_name = getattr(message.channel, "name", "unknown")
+        channel_id = message.channel.id
 
         # 1. Sauvegarder le message brut
         msg_data = {
             "discord_message_id": str(message.id),
             "guild_id": str(message.guild.id) if message.guild else "0",
             "guild_name": guild_name,
-            "channel_id": str(message.channel.id),
+            "channel_id": str(channel_id),
             "channel_name": channel_name,
             "author_id": str(message.author.id),
             "author_name": message.author.display_name,
@@ -100,27 +100,16 @@ class TradeListener(discord.Client):
             message.content[:100] if message.content else "(embed/attachment)",
         )
 
-        # 2. Tenter de parser le contenu comme signal de trade
-        trade = trade_parser.parse_message(message.content, message.author.display_name)
-        if trade:
-            trade_dict = trade.to_dict()
-            trade_dict["message_id"] = str(message.id)
-            await database.save_parsed_trade(trade_dict)
-            # Envoyer vers Supabase seulement si le channel n'est pas exclu
-            if channel_name not in trade_parser.CHANNELS_EXCLUDED_FROM_SUPABASE:
-                await self._push_to_supabase(trade, channel_name, str(message.id))
+        # 2. Router selon le thread/channel
+        if channel_id == config.ALERTS_THREAD_ID:
+            await self._process_alerts(message)
+        elif channel_id == config.TRADES_THREAD_ID:
+            await self._process_trade_signal(message, channel_name)
+        else:
+            # Autres channels: tenter le parsing generique
+            await self._process_trade_signal(message, channel_name)
 
-        # 3. Parser les embeds aussi
-        for embed in message.embeds:
-            embed_trade = trade_parser.parse_embed(embed.to_dict(), message.author.display_name)
-            if embed_trade:
-                embed_trade_dict = embed_trade.to_dict()
-                embed_trade_dict["message_id"] = str(message.id)
-                await database.save_parsed_trade(embed_trade_dict)
-                if channel_name not in trade_parser.CHANNELS_EXCLUDED_FROM_SUPABASE:
-                    await self._push_to_supabase(embed_trade, channel_name, str(message.id))
-
-        # 4. Telecharger les images
+        # 3. Telecharger les images
         for attachment in message.attachments:
             if attachment.content_type and attachment.content_type.startswith("image/"):
                 local_path = await self._download_image(attachment, str(message.id))
@@ -132,9 +121,86 @@ class TradeListener(discord.Client):
                     "content_type": attachment.content_type,
                 })
 
+    async def _process_trade_signal(self, message: discord.Message, channel_name: str):
+        """Parse et insere un nouveau signal de trade."""
+        trade = trade_parser.parse_message(message.content, message.author.display_name)
+        if trade:
+            trade_dict = trade.to_dict()
+            trade_dict["message_id"] = str(message.id)
+            await database.save_parsed_trade(trade_dict)
+            if channel_name not in trade_parser.CHANNELS_EXCLUDED_FROM_SUPABASE:
+                await self._push_to_supabase(trade, channel_name, str(message.id))
+
+        for embed in message.embeds:
+            embed_trade = trade_parser.parse_embed(embed.to_dict(), message.author.display_name)
+            if embed_trade:
+                embed_trade_dict = embed_trade.to_dict()
+                embed_trade_dict["message_id"] = str(message.id)
+                await database.save_parsed_trade(embed_trade_dict)
+                if channel_name not in trade_parser.CHANNELS_EXCLUDED_FROM_SUPABASE:
+                    await self._push_to_supabase(embed_trade, channel_name, str(message.id))
+
+    async def _process_alerts(self, message: discord.Message):
+        """Parse les alertes active-alerts et met a jour les trades dans Supabase."""
+        alerts = trade_parser.parse_alert_message(message.content)
+        if not alerts:
+            return
+
+        for alert in alerts:
+            if not alert.traders:
+                continue
+
+            symbol = alert.asset
+            if symbol and not symbol.endswith("USDT"):
+                symbol = f"{symbol}USDT"
+
+            side = alert.direction
+            if side == "SPOT":
+                side = "LONG"  # Spot = long par defaut
+
+            for trader in alert.traders:
+                existing = await supabase_client.find_open_trade(symbol, trader, side)
+                if not existing:
+                    logger.warning(
+                        "ALERT: Trade ouvert non trouve pour %s %s %s - action: %s",
+                        symbol, side, trader, alert.action,
+                    )
+                    continue
+
+                trade_id = existing["id"]
+                updates = {"updated_at": "now()"}
+
+                if alert.new_status and alert.new_status != "open":
+                    updates["status"] = alert.new_status
+                if alert.close_reason:
+                    updates["close_reason"] = alert.close_reason
+
+                # Limit order filled -> ep1_status = filled
+                if alert.event_type == "ep_filled":
+                    if existing.get("ep1_status") == "waiting":
+                        updates["ep1_status"] = "filled"
+                    elif existing.get("ep2_status") == "waiting":
+                        updates["ep2_status"] = "filled"
+
+                # Stops moved to BE -> sl_status = closed (SL deplace)
+                if alert.event_type == "sl_to_be":
+                    updates["sl_status"] = "closed"
+
+                # Updated Average Entry -> update ep1
+                if alert.new_entry:
+                    updates["ep1"] = alert.new_entry
+                    updates["ep1_status"] = "filled"
+
+                result = await supabase_client.update_trade(trade_id, updates)
+                if result:
+                    logger.info(
+                        "ALERT: Trade #%s mis a jour - %s %s %s -> %s",
+                        trade_id, symbol, trader, alert.action,
+                        {k: v for k, v in updates.items() if k != "updated_at"},
+                    )
+
     async def _push_to_supabase(self, trade: trade_parser.TradeSignal, channel_name: str, message_id: str):
         """Convertit un TradeSignal en row Supabase et l'insere."""
-        # Construire le symbol au format XXXUSDT
         symbol = trade.asset
         if symbol and not symbol.endswith("USDT"):
             symbol = f"{symbol}USDT"
@@ -150,7 +216,6 @@ class TradeListener(discord.Client):
             "sl_status": "waiting" if trade.stop_loss else None,
         }
 
-        # Entry points : ep1 = entry_high, ep2 = entry_low (si different)
         if trade.entry_high is not None:
             row["ep1"] = trade.entry_high
             row["ep1_status"] = "waiting"
@@ -159,7 +224,6 @@ class TradeListener(discord.Client):
             row["ep2"] = trade.entry_low
             row["ep2_status"] = "waiting"
 
-        # Take profit si disponible
         if trade.take_profit is not None:
             row["tp1"] = trade.take_profit
             row["tp1_status"] = "waiting"
@@ -167,19 +231,16 @@ class TradeListener(discord.Client):
         result = await supabase_client.insert_trade(row)
         if result:
             logger.info(
-                "SUPABASE: Trade #%s insere - %s %s ep1=%s sl=%s",
-                result.get("id"), symbol, trade.direction,
+                "SUPABASE: Trade #%s insere - %s %s %s ep1=%s sl=%s",
+                result.get("id"), symbol, trade.direction, trade.trader,
                 row.get("ep1"), row.get("sl"),
             )
 
     async def _download_image(self, attachment: discord.Attachment, message_id: str) -> Path | None:
-        """Telecharge une image localement."""
         try:
             if self._http_session is None:
                 self._http_session = aiohttp.ClientSession()
 
-            # Nommer le fichier avec l'ID du message pour eviter les doublons
-            ext = Path(attachment.filename).suffix or ".png"
             filename = f"{message_id}_{attachment.filename}"
             local_path = config.IMAGES_DIR / filename
 

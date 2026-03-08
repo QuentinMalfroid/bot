@@ -67,7 +67,13 @@ CREATE TABLE IF NOT EXISTS trades (
 ALTER TABLE trades ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Allow all for anon" ON trades FOR ALL USING (true) WITH CHECK (true);
 
+-- Colonnes ajoutees pour le suivi des alerts
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason TEXT
+    CHECK (close_reason IN ('profit', 'small_profit', 'loss', 'breakeven', 'stopped_out', 'cancelled') OR close_reason IS NULL);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
 -- Index utiles
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_created ON trades(created_at);
+CREATE INDEX IF NOT EXISTS idx_trades_trader ON trades(trader);

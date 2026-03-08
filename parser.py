@@ -1,7 +1,7 @@
 import re
 import logging
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +56,15 @@ def _parse_wwg_short_format(content: str, author_name: str) -> Optional[TradeSig
         @WWG: Woods long eth 1864-1834 stop 1763
         @WWG: Eliz long wld 399-38 stop 357 pnl: +20%
     """
-    pattern = r"@WWG:\s*(\w+)\s+(long|short)\s+(\w+)\s+([\d.]+)[-–]([\d.]+)\s+stop\s+([\d.]+)(?:\s+pnl:\s*([+-]?[\d.]+)%)?"
+    pattern = r"@WWG:\s*(-?\w+)\s+(long|short)\s+(\w+)\s+([\d.]+)(?:[-–]([\d.]+))?\s+stop\s+([\d.]+)(?:\s+pnl:\s*([+-]?[\d.]+)%)?"
     match = re.search(pattern, content, re.IGNORECASE)
     if not match:
         return None
 
     trader, direction, asset, price1, price2, stop, pnl = match.groups()
-    p1, p2 = float(price1), float(price2)
+    trader = trader.lstrip("-").strip()
+    p1 = float(price1)
+    p2 = float(price2) if price2 else p1
 
     return TradeSignal(
         trader=trader,
@@ -99,8 +101,8 @@ def _parse_structured_format(content: str, author_name: str) -> Optional[TradeSi
     e2 = float(entry2.replace(",", "")) if entry2 else e1
 
     # Extraire le trader depuis @WWG: Nom en debut de message
-    trader_match = re.search(r"@WWG:\s*(\w+)", content)
-    trader = trader_match.group(1) if trader_match else None
+    trader_match = re.search(r"@WWG:\s*(-?\w+)", content)
+    trader = trader_match.group(1).lstrip("-").strip() if trader_match else None
 
     return TradeSignal(
         trader=trader,
@@ -200,8 +202,8 @@ def _parse_eth_limit_format(content: str, author_name: str) -> Optional[TradeSig
     direction = "LONG" if sl < avg_entry else "SHORT"
 
     # Extraire le trader depuis @WWG: Nom
-    trader_match = re.search(r"@WWG:\s*(\w+)", content)
-    trader = trader_match.group(1) if trader_match else author_name or None
+    trader_match = re.search(r"@WWG:\s*(-?\w+)", content)
+    trader = trader_match.group(1).lstrip("-").strip() if trader_match else author_name or None
 
     return TradeSignal(
         trader=trader,
@@ -243,3 +245,114 @@ _PARSERS_LOCAL_ONLY = [
 
 # Channels a exclure de l'envoi vers Supabase
 CHANNELS_EXCLUDED_FROM_SUPABASE = {"Coinbase"}
+
+
+# --- Active Alerts parsing ---
+
+# Map des actions vers (status, close_reason)
+_ACTION_MAP = {
+    "limit order filled": ("open", None, "ep_filled"),
+    "stopped out": ("closed", "stopped_out", None),
+    "stopped be": ("closed", "breakeven", None),
+    "closed be": ("closed", "breakeven", None),
+    "closed in profits": ("closed", "profit", None),
+    "closed in small profit": ("closed", "small_profit", None),
+    "closed in loss": ("closed", "loss", None),
+    "limit order cancelled": ("cancelled", "cancelled", None),
+    "stops moved to be": ("open", None, "sl_to_be"),
+}
+
+
+@dataclass
+class TradeAlert:
+    direction: Optional[str] = None  # LONG / SHORT / SPOT
+    asset: Optional[str] = None
+    action: Optional[str] = None  # raw action text
+    traders: Optional[List[str]] = None
+    # Derived from action
+    new_status: Optional[str] = None  # open / closed / cancelled
+    close_reason: Optional[str] = None
+    event_type: Optional[str] = None  # ep_filled / sl_to_be / None
+    # For "Updated Average Entry to X"
+    new_entry: Optional[float] = None
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def parse_alert_message(content: str) -> List[TradeAlert]:
+    """Parse un message du channel active-alerts.
+
+    Chaque ligne du message peut contenir une alerte.
+    Format: :<Side>: <ASSET> ...trades: <action> @WWG: <trader>[, @WWG: <trader2>]
+    """
+    if not content:
+        return []
+
+    alerts = []
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        alert = _parse_single_alert(line)
+        if alert:
+            alerts.append(alert)
+
+    return alerts
+
+
+def _parse_single_alert(line: str) -> Optional[TradeAlert]:
+    """Parse une seule ligne d'alerte active."""
+    # Pattern: :<Side>: <ASSET> ...trades: <action> @WWG: <trader>
+    pattern = r":(Long|Short|Spot):\s*(\w+)\s.*?trades:\s*(.+?)(?:\s*@WWG:\s*(.+))$"
+    match = re.search(pattern, line, re.IGNORECASE)
+    if not match:
+        return None
+
+    direction, asset, action_raw, traders_raw = match.groups()
+    action = action_raw.strip()
+    action_lower = action.lower()
+
+    # Parse traders (peut etre "trader1, @WWG: trader2, @WWG: trader3")
+    traders = []
+    if traders_raw:
+        for t in re.split(r",\s*(?:@WWG:\s*)?", traders_raw):
+            name = t.strip().lstrip("-").strip()
+            if name:
+                traders.append(name)
+
+    # Determiner le status et close_reason
+    new_status = None
+    close_reason = None
+    event_type = None
+    new_entry = None
+
+    for key, (status, reason, evt) in _ACTION_MAP.items():
+        if action_lower.startswith(key):
+            new_status = status
+            close_reason = reason
+            event_type = evt
+            break
+
+    # Cas special: Updated Average Entry to X
+    entry_match = re.search(r"updated average entry to ([\d.]+)", action_lower)
+    if entry_match:
+        new_entry = float(entry_match.group(1))
+        new_status = "open"
+        event_type = "entry_updated"
+
+    if not new_status and not new_entry:
+        logger.warning("Action non reconnue dans active-alerts: %s", action)
+        return None
+
+    return TradeAlert(
+        direction=direction.upper(),
+        asset=asset.upper(),
+        action=action,
+        traders=traders,
+        new_status=new_status,
+        close_reason=close_reason,
+        event_type=event_type,
+        new_entry=new_entry,
+    )
