@@ -7,7 +7,7 @@ Rules:
 - Min R:R ratio check before entering
 - Daily drawdown limit (stop trading if exceeded)
 - Consecutive loss counter (reduce to 0.5R after N losses)
-- Spot only (no shorts)
+- LONG -> Spot, SHORT -> Futures
 """
 import logging
 from dataclasses import dataclass, field
@@ -43,16 +43,13 @@ async def assess_trade(
     stop_loss: float,
     take_profit: Optional[float],
     direction: str,
+    use_futures: bool = False,
 ) -> RiskCheck:
     """Evaluate whether a trade should be taken and calculate position size.
 
     Returns a RiskCheck with allowed=True and sizing info, or allowed=False with reason.
     """
     global _daily_pnl_usdt, _daily_date, _consecutive_losses
-
-    # --- Spot only ---
-    if direction == "SHORT":
-        return RiskCheck(allowed=False, reason="SHORT not supported on spot")
 
     if not stop_loss or stop_loss <= 0:
         return RiskCheck(allowed=False, reason="No stop-loss provided")
@@ -63,6 +60,8 @@ async def assess_trade(
     # --- Validate SL direction ---
     if direction == "LONG" and stop_loss >= entry_price:
         return RiskCheck(allowed=False, reason=f"SL ({stop_loss}) must be below entry ({entry_price}) for LONG")
+    if direction == "SHORT" and stop_loss <= entry_price:
+        return RiskCheck(allowed=False, reason=f"SL ({stop_loss}) must be above entry ({entry_price}) for SHORT")
 
     # --- R:R ratio check ---
     risk_per_unit = abs(entry_price - stop_loss)
@@ -86,8 +85,13 @@ async def assess_trade(
         _daily_date = today
         _daily_pnl_usdt = await _load_daily_pnl(today)
 
-    total_balance = await binance_client.get_balance("USDT")
-    usdc_balance = await binance_client.get_balance("USDC")
+    # Get balance from the right account (spot or futures)
+    if use_futures:
+        total_balance = await binance_client.futures_get_balance("USDT")
+        usdc_balance = await binance_client.futures_get_balance("USDC")
+    else:
+        total_balance = await binance_client.get_balance("USDT")
+        usdc_balance = await binance_client.get_balance("USDC")
     total_account = total_balance + usdc_balance
 
     if total_account <= 0:

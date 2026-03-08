@@ -1,5 +1,6 @@
 """Execute trades on Binance based on parsed Discord signals.
 
+Routes: LONG -> Spot, SHORT -> Futures.
 Uses risk_manager for 1R-based dynamic position sizing.
 """
 import logging
@@ -24,15 +25,25 @@ def _to_binance_symbol(asset: str) -> str:
     return f"{asset}{_BINANCE_QUOTE}"
 
 
+def _is_futures(direction: str) -> bool:
+    """SHORT trades go to futures, LONG trades go to spot."""
+    return direction == "SHORT"
+
+
 async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id: str):
     """Execute a new trade signal on Binance with proper 1R risk management."""
     if not config.BINANCE_API_KEY:
         return
 
     symbol = _to_binance_symbol(trade.asset)
+    use_futures = _is_futures(trade.direction)
 
-    # Verify symbol exists on Binance
-    sym_info = await binance_client.get_symbol_info(symbol)
+    # Verify symbol exists
+    if use_futures:
+        sym_info = await binance_client.futures_get_symbol_info(symbol)
+    else:
+        sym_info = await binance_client.get_symbol_info(symbol)
+
     if not sym_info:
         logger.warning("EXECUTOR: Symbol %s not found on Binance, skipping", symbol)
         return
@@ -41,8 +52,12 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         logger.warning("EXECUTOR: Symbol %s not trading (status=%s)", symbol, sym_info.get("status"))
         return
 
-    # Get current price for validation
-    current_price = await binance_client.get_price(symbol)
+    # Get current price
+    if use_futures:
+        current_price = await binance_client.futures_get_price(symbol)
+    else:
+        current_price = await binance_client.get_price(symbol)
+
     if not current_price:
         logger.error("EXECUTOR: Cannot get price for %s", symbol)
         return
@@ -53,11 +68,6 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
 
     if ep1_price is None:
         logger.error("EXECUTOR: No entry price for %s", symbol)
-        return
-
-    # For SHORT on spot, skip
-    if trade.direction == "SHORT":
-        logger.info("EXECUTOR: SHORT signal on spot - skipping (spot only supports LONG)")
         return
 
     # Use average entry for risk calculation when we have EP1+EP2
@@ -71,6 +81,7 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         stop_loss=trade.stop_loss,
         take_profit=trade.take_profit,
         direction=trade.direction,
+        use_futures=use_futures,
     )
 
     if not risk.allowed:
@@ -89,7 +100,10 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         ep1_crypto = total_crypto
         ep2_crypto = 0
 
-    side = "BUY"
+    # For futures: LONG=BUY, SHORT=SELL (opening side)
+    # For spot: always BUY (LONG only)
+    order_side = "SELL" if trade.direction == "SHORT" else "BUY"
+    market_type = "futures" if use_futures else "spot"
 
     # Supabase row for tracking
     row = {
@@ -109,7 +123,10 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
     }
 
     # Place EP1 limit order
-    ep1_order = await binance_client.place_limit_order(symbol, side, ep1_crypto, ep1_price)
+    if use_futures:
+        ep1_order = await binance_client.futures_place_limit_order(symbol, order_side, ep1_crypto, ep1_price)
+    else:
+        ep1_order = await binance_client.place_limit_order(symbol, order_side, ep1_crypto, ep1_price)
 
     if ep1_order:
         row["ep1_id"] = str(ep1_order["orderId"])
@@ -118,19 +135,22 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
 
         if ep1_order.get("status") == "FILLED":
             row["ep1_status"] = "filled"
-            logger.info("EXECUTOR: EP1 immediately filled for %s", symbol)
+            logger.info("EXECUTOR: EP1 immediately filled for %s (%s)", symbol, market_type)
         else:
             logger.info(
-                "EXECUTOR: EP1 limit order placed for %s @ %s qty=%s (orderId=%s)",
-                symbol, ep1_price, ep1_order.get("origQty"), ep1_order["orderId"],
+                "EXECUTOR: EP1 %s limit order placed for %s @ %s qty=%s (orderId=%s)",
+                market_type, symbol, ep1_price, ep1_order.get("origQty"), ep1_order["orderId"],
             )
     else:
-        logger.error("EXECUTOR: Failed to place EP1 order for %s", symbol)
+        logger.error("EXECUTOR: Failed to place EP1 %s order for %s", market_type, symbol)
         return
 
     # Place EP2 limit order if we have a second entry
     if ep2_price and ep2_crypto > 0:
-        ep2_order = await binance_client.place_limit_order(symbol, side, ep2_crypto, ep2_price)
+        if use_futures:
+            ep2_order = await binance_client.futures_place_limit_order(symbol, order_side, ep2_crypto, ep2_price)
+        else:
+            ep2_order = await binance_client.place_limit_order(symbol, order_side, ep2_crypto, ep2_price)
         if ep2_order:
             row["ep2"] = ep2_price
             row["ep2_id"] = str(ep2_order["orderId"])
@@ -138,17 +158,17 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
             row["ep2_size_usdt"] = float(ep2_order.get("origQty", ep2_crypto)) * ep2_price
             row["ep2_size_crypto"] = float(ep2_order.get("origQty", ep2_crypto))
             logger.info(
-                "EXECUTOR: EP2 limit order placed for %s @ %s qty=%s (orderId=%s)",
-                symbol, ep2_price, ep2_order.get("origQty"), ep2_order["orderId"],
+                "EXECUTOR: EP2 %s limit order placed for %s @ %s qty=%s (orderId=%s)",
+                market_type, symbol, ep2_price, ep2_order.get("origQty"), ep2_order["orderId"],
             )
 
     # Insert trade in Supabase
     result = await supabase_client.insert_trade(row)
     if result:
         logger.info(
-            "EXECUTOR: Trade #%s created - %s %s %s ep1=%s ep2=%s sl=%s "
+            "EXECUTOR: Trade #%s created [%s] - %s %s %s ep1=%s ep2=%s sl=%s "
             "risk=%.2f USDT (%.1fR x%.1f) R:R=%.2f",
-            result.get("id"), symbol, trade.direction, trade.trader,
+            result.get("id"), market_type, symbol, trade.direction, trade.trader,
             ep1_price, ep2_price, trade.stop_loss,
             risk.risk_capital, config.RISK_PER_TRADE_PCT, risk.r_multiplier,
             risk.rr_ratio,
@@ -180,15 +200,16 @@ async def handle_alert(alert: TradeAlert):
             continue
 
         trade_id = existing["id"]
+        use_futures = _is_futures(existing.get("side", "LONG"))
 
         if alert.event_type == "ep_filled":
-            await _handle_ep_filled(existing, symbol, trade_id)
+            await _handle_ep_filled(existing, symbol, trade_id, use_futures)
 
         elif alert.new_status in ("closed", "cancelled"):
-            await _handle_close(existing, symbol, trade_id, alert)
+            await _handle_close(existing, symbol, trade_id, alert, use_futures)
 
         elif alert.event_type == "sl_to_be":
-            await _handle_sl_to_be(existing, symbol, trade_id)
+            await _handle_sl_to_be(existing, symbol, trade_id, use_futures)
 
         elif alert.event_type == "entry_updated" and alert.new_entry:
             logger.info(
@@ -197,7 +218,7 @@ async def handle_alert(alert: TradeAlert):
             )
 
 
-async def _handle_ep_filled(trade: dict, symbol: str, trade_id: int):
+async def _handle_ep_filled(trade: dict, symbol: str, trade_id: int, use_futures: bool):
     """When an entry fills, place the stop-loss order."""
     sl_price = trade.get("sl")
     sl_id = trade.get("sl_id")
@@ -216,10 +237,17 @@ async def _handle_ep_filled(trade: dict, symbol: str, trade_id: int):
         logger.warning("EXECUTOR: Cannot place SL - no filled quantity for trade #%s", trade_id)
         return
 
+    # SL side: opposite of position direction
     sl_side = "SELL" if trade.get("side") == "LONG" else "BUY"
-    sl_order = await binance_client.place_stop_loss_order(
-        symbol, sl_side, total_qty, float(sl_price),
-    )
+
+    if use_futures:
+        sl_order = await binance_client.futures_place_stop_loss_order(
+            symbol, sl_side, total_qty, float(sl_price),
+        )
+    else:
+        sl_order = await binance_client.place_stop_loss_order(
+            symbol, sl_side, total_qty, float(sl_price),
+        )
 
     if sl_order:
         await supabase_client.update_trade(trade_id, {
@@ -232,54 +260,74 @@ async def _handle_ep_filled(trade: dict, symbol: str, trade_id: int):
         )
 
 
-async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAlert):
-    """Close a trade: cancel open orders and sell position. Track P&L."""
+async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAlert,
+                         use_futures: bool):
+    """Close a trade: cancel open orders, close position, track P&L."""
+    cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
+
     # Cancel any open limit orders
     for ep in ("ep1", "ep2", "ep3"):
         if trade.get(f"{ep}_status") == "waiting" and trade.get(f"{ep}_id"):
             order_id = int(trade[f"{ep}_id"])
-            await binance_client.cancel_order(symbol, order_id)
+            await cancel_fn(symbol, order_id)
             logger.info("EXECUTOR: Cancelled %s order %s for trade #%s", ep, order_id, trade_id)
 
     # Cancel SL order if exists
     if trade.get("sl_id") and trade.get("sl_status") == "waiting":
-        await binance_client.cancel_order(symbol, int(trade["sl_id"]))
+        await cancel_fn(symbol, int(trade["sl_id"]))
         logger.info("EXECUTOR: Cancelled SL order for trade #%s", trade_id)
 
-    # Sell any held position (for LONG trades) and calculate P&L
     realized_pnl = None
-    if trade.get("side") == "LONG":
-        base_asset = symbol.replace("USDT", "")
-        balance = await binance_client.get_balance(base_asset)
-        if balance > 0:
-            sell_result = await binance_client.place_market_order(symbol, "SELL", quantity=balance)
-            if sell_result:
-                sold_qty = float(sell_result.get("executedQty", 0))
-                # Estimate P&L from fills
-                sell_value = 0
-                for fill in sell_result.get("fills", []):
-                    sell_value += float(fill["price"]) * float(fill["qty"])
-                if sell_value == 0:
-                    sell_price = await binance_client.get_price(symbol)
-                    sell_value = sold_qty * (sell_price or 0)
 
-                # Calculate cost basis from entry prices
-                cost_basis = 0
-                for ep in ("ep1", "ep2", "ep3"):
-                    if trade.get(f"{ep}_status") == "filled" and trade.get(ep):
-                        qty = trade.get(f"{ep}_size_crypto")
-                        if qty:
-                            cost_basis += float(trade[ep]) * float(qty)
-
-                if cost_basis > 0:
-                    realized_pnl = sell_value - cost_basis
+    if use_futures:
+        # Close futures position with opposite market order
+        position = await binance_client.futures_get_position(symbol)
+        if position:
+            pos_amt = abs(float(position.get("positionAmt", 0)))
+            if pos_amt > 0:
+                close_side = "BUY" if trade.get("side") == "SHORT" else "SELL"
+                close_result = await binance_client.futures_place_market_order(symbol, close_side, pos_amt)
+                if close_result:
+                    # Futures P&L from position info
+                    unrealized = float(position.get("unRealizedProfit", 0))
+                    realized_pnl = unrealized
                     risk_manager.record_trade_result(realized_pnl)
+                    logger.info(
+                        "EXECUTOR: Closed futures position for trade #%s - %s %s %s, P&L: %.2f USDT",
+                        trade_id, close_side, pos_amt, symbol, realized_pnl,
+                    )
+    else:
+        # Close spot position (sell held asset)
+        if trade.get("side") == "LONG":
+            base_asset = symbol.replace("USDT", "")
+            balance = await binance_client.get_balance(base_asset)
+            if balance > 0:
+                sell_result = await binance_client.place_market_order(symbol, "SELL", quantity=balance)
+                if sell_result:
+                    sold_qty = float(sell_result.get("executedQty", 0))
+                    sell_value = 0
+                    for fill in sell_result.get("fills", []):
+                        sell_value += float(fill["price"]) * float(fill["qty"])
+                    if sell_value == 0:
+                        sell_price = await binance_client.get_price(symbol)
+                        sell_value = sold_qty * (sell_price or 0)
 
-                logger.info(
-                    "EXECUTOR: Closed position for trade #%s - sold %s %s, P&L: %s USDT",
-                    trade_id, sold_qty, symbol,
-                    f"{realized_pnl:.2f}" if realized_pnl is not None else "unknown",
-                )
+                    cost_basis = 0
+                    for ep in ("ep1", "ep2", "ep3"):
+                        if trade.get(f"{ep}_status") == "filled" and trade.get(ep):
+                            qty = trade.get(f"{ep}_size_crypto")
+                            if qty:
+                                cost_basis += float(trade[ep]) * float(qty)
+
+                    if cost_basis > 0:
+                        realized_pnl = sell_value - cost_basis
+                        risk_manager.record_trade_result(realized_pnl)
+
+                    logger.info(
+                        "EXECUTOR: Closed spot position for trade #%s - sold %s %s, P&L: %s USDT",
+                        trade_id, sold_qty, symbol,
+                        f"{realized_pnl:.2f}" if realized_pnl is not None else "unknown",
+                    )
 
     # Update Supabase
     updates = {"status": alert.new_status or "closed"}
@@ -297,10 +345,12 @@ async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAle
     )
 
 
-async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int):
+async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures: bool):
     """Move stop-loss to breakeven (entry price)."""
+    cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
+
     if trade.get("sl_id") and trade.get("sl_status") == "waiting":
-        await binance_client.cancel_order(symbol, int(trade["sl_id"]))
+        await cancel_fn(symbol, int(trade["sl_id"]))
 
     be_price = trade.get("ep1")
     if not be_price:
@@ -317,9 +367,15 @@ async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int):
         return
 
     sl_side = "SELL" if trade.get("side") == "LONG" else "BUY"
-    sl_order = await binance_client.place_stop_loss_order(
-        symbol, sl_side, total_qty, float(be_price),
-    )
+
+    if use_futures:
+        sl_order = await binance_client.futures_place_stop_loss_order(
+            symbol, sl_side, total_qty, float(be_price),
+        )
+    else:
+        sl_order = await binance_client.place_stop_loss_order(
+            symbol, sl_side, total_qty, float(be_price),
+        )
 
     if sl_order:
         await supabase_client.update_trade(trade_id, {
