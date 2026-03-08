@@ -22,9 +22,11 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "cryptobot.db")))
 DATA_DIR.mkdir(exist_ok=True)
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
-# Thread IDs for WWG channels
+# Thread/Channel IDs for WWG
 TRADES_THREAD_ID = int(os.getenv("TRADES_THREAD_ID", "1301066783909744680"))
 ALERTS_THREAD_ID = int(os.getenv("ALERTS_THREAD_ID", "1301074706656530474"))
+ACTIVE_FUTURES_ID = int(os.getenv("ACTIVE_FUTURES_ID", "1304468260040740894"))
+ACTIVE_SPOT_ID = int(os.getenv("ACTIVE_SPOT_ID", "1306633648984031263"))
 
 # Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")

@@ -43,8 +43,10 @@ class TradeListener(discord.Client):
             )
 
         logger.info(
-            "Listener pret. Surveillance de %d serveur(s). Threads: trades=%s, alerts=%s",
+            "Listener pret. Surveillance de %d serveur(s). "
+            "trades=%s, alerts=%s, futures=%s, spot=%s",
             len(monitored), config.TRADES_THREAD_ID, config.ALERTS_THREAD_ID,
+            config.ACTIVE_FUTURES_ID, config.ACTIVE_SPOT_ID,
         )
 
     async def on_message(self, message: discord.Message):
@@ -123,9 +125,9 @@ class TradeListener(discord.Client):
         )
 
         # 2. Router selon le thread/channel
-        if channel_id == config.ALERTS_THREAD_ID:
+        if channel_id in (config.ALERTS_THREAD_ID, config.ACTIVE_FUTURES_ID):
             await self._process_alerts(message)
-        elif channel_id == config.TRADES_THREAD_ID:
+        elif channel_id in (config.TRADES_THREAD_ID, config.ACTIVE_SPOT_ID):
             await self._process_trade_signal(message, channel_name)
         else:
             # Autres channels: tenter le parsing generique

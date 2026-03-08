@@ -19,10 +19,16 @@ logger = logging.getLogger(__name__)
 
 _BINANCE_QUOTE = "USDT"
 
-# Channel IDs that route to futures (trades + active-alerts threads)
+# Channel IDs that route to futures
 _FUTURES_CHANNEL_IDS = {
-    config.TRADES_THREAD_ID,
-    config.ALERTS_THREAD_ID,
+    config.TRADES_THREAD_ID,      # trades thread
+    config.ALERTS_THREAD_ID,      # active-alerts thread
+    config.ACTIVE_FUTURES_ID,     # active-futures thread
+}
+
+# Channel IDs that route to spot
+_SPOT_CHANNEL_IDS = {
+    config.ACTIVE_SPOT_ID,        # active-spot thread
 }
 
 
