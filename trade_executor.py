@@ -78,6 +78,12 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         logger.warning("EXECUTOR: Symbol %s not trading (status=%s)", symbol, sym_info.get("status"))
         return
 
+    # Setup isolated margin + leverage for futures (WWG rules)
+    if use_futures:
+        await binance_client.futures_setup_symbol(
+            symbol, config.FUTURES_LEVERAGE, config.FUTURES_MARGIN_TYPE,
+        )
+
     # Get current price
     if use_futures:
         current_price = await binance_client.futures_get_price(symbol)

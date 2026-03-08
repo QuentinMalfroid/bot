@@ -279,6 +279,48 @@ async def futures_get_open_orders(symbol: Optional[str] = None) -> list:
     return result if isinstance(result, list) else []
 
 
+async def futures_setup_symbol(symbol: str, leverage: int, margin_type: str = "ISOLATED") -> bool:
+    """Set leverage and margin type for a futures symbol. Returns True on success."""
+    # Set margin type (may fail if already set or has open position)
+    # Set margin type — Binance returns HTTP 400 with code -4046 if already set
+    session = await _get_session()
+    params = {"symbol": symbol, "marginType": margin_type}
+    params["timestamp"] = int(__import__("time").time() * 1000)
+    qs = _sign(params)
+    url = f"{FUTURES_BASE}/fapi/v1/marginType?{qs}"
+    try:
+        async with session.request("POST", url) as resp:
+            data = await resp.json()
+            if resp.status == 200:
+                logger.info("BINANCE FUTURES: %s margin type set to %s", symbol, margin_type)
+            elif data.get("code") == -4046:
+                pass  # Already set to this margin type
+            else:
+                logger.warning("BINANCE FUTURES: Could not set margin type for %s: %s", symbol, data)
+    except Exception as e:
+        logger.warning("BINANCE FUTURES: margin type error for %s: %s", symbol, e)
+
+    # Set leverage
+    lev_result = await _request("POST", "/fapi/v1/leverage", {
+        "symbol": symbol,
+        "leverage": leverage,
+    }, base_url=FUTURES_BASE)
+    if lev_result and lev_result.get("leverage"):
+        logger.info("BINANCE FUTURES: %s leverage set to %sx", symbol, lev_result["leverage"])
+        return True
+    else:
+        logger.error("BINANCE FUTURES: Failed to set leverage for %s: %s", symbol, lev_result)
+        return False
+
+
+async def futures_get_order(symbol: str, order_id: int) -> Optional[dict]:
+    """Get a specific futures order by ID."""
+    return await _request("GET", "/fapi/v1/order", {
+        "symbol": symbol,
+        "orderId": order_id,
+    }, base_url=FUTURES_BASE)
+
+
 # ============================================================
 # SPOT orders (unchanged)
 # ============================================================

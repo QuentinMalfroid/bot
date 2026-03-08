@@ -8,6 +8,7 @@ import discord
 import binance_client
 import config
 import database
+import order_monitor
 import parser as trade_parser
 import supabase_client
 import trade_executor
@@ -42,12 +43,42 @@ class TradeListener(discord.Client):
                 [(g.name, g.id) for g in self.guilds],
             )
 
+        # Join WWG threads so we receive their messages
+        await self._join_wwg_threads()
+
         logger.info(
             "Listener pret. Surveillance de %d serveur(s). "
             "trades=%s, alerts=%s, futures=%s, spot=%s",
             len(monitored), config.TRADES_THREAD_ID, config.ALERTS_THREAD_ID,
             config.ACTIVE_FUTURES_ID, config.ACTIVE_SPOT_ID,
         )
+
+        # Start Binance order monitor
+        if config.BINANCE_API_KEY:
+            asyncio.create_task(order_monitor.start())
+
+    async def _join_wwg_threads(self):
+        """Join all WWG threads so we receive their messages and edits."""
+        thread_ids = [
+            config.TRADES_THREAD_ID,
+            config.ALERTS_THREAD_ID,
+            config.ACTIVE_FUTURES_ID,
+            config.ACTIVE_SPOT_ID,
+        ]
+        for tid in thread_ids:
+            try:
+                thread = self.get_channel(tid)
+                if thread is None:
+                    thread = await self.fetch_channel(tid)
+                if thread and hasattr(thread, "join"):
+                    await thread.join()
+                    logger.info("Joined thread: %s (%s)", getattr(thread, "name", "?"), tid)
+                elif thread:
+                    logger.info("Channel found (not a thread): %s (%s)", getattr(thread, "name", "?"), tid)
+                else:
+                    logger.warning("Could not find thread/channel %s", tid)
+            except Exception as e:
+                logger.warning("Could not join thread %s: %s", tid, e)
 
     async def on_message(self, message: discord.Message):
         if message.author.id == self.user.id:
@@ -97,25 +128,26 @@ class TradeListener(discord.Client):
         if not saved:
             return
 
-        # Envoyer le message brut vers Supabase
-        supabase_msg = {
-            "discord_message_id": str(message.id),
-            "guild_id": str(message.guild.id) if message.guild else "0",
-            "guild_name": guild_name,
-            "channel_id": str(channel_id),
-            "channel_name": channel_name,
-            "author_id": str(message.author.id),
-            "author_name": message.author.display_name,
-            "is_bot": message.author.bot,
-            "content": message.content or "",
-            "embeds": [e.to_dict() for e in message.embeds],
-            "attachments": [
-                {"url": a.url, "filename": a.filename, "content_type": a.content_type}
-                for a in message.attachments
-            ],
-            "created_at": message.created_at.isoformat(),
-        }
-        await supabase_client.insert_message(supabase_msg)
+        # Only save WWG channel messages to Supabase
+        if channel_id in config.WWG_CHANNEL_IDS:
+            supabase_msg = {
+                "discord_message_id": str(message.id),
+                "guild_id": str(message.guild.id) if message.guild else "0",
+                "guild_name": guild_name,
+                "channel_id": str(channel_id),
+                "channel_name": channel_name,
+                "author_id": str(message.author.id),
+                "author_name": message.author.display_name,
+                "is_bot": message.author.bot,
+                "content": message.content or "",
+                "embeds": [e.to_dict() for e in message.embeds],
+                "attachments": [
+                    {"url": a.url, "filename": a.filename, "content_type": a.content_type}
+                    for a in message.attachments
+                ],
+                "created_at": message.created_at.isoformat(),
+            }
+            await supabase_client.insert_message(supabase_msg)
 
         logger.debug(
             "[#%s] %s: %s",
@@ -124,13 +156,10 @@ class TradeListener(discord.Client):
             message.content[:100] if message.content else "(embed/attachment)",
         )
 
-        # 2. Router selon le thread/channel
+        # 2. Router selon le thread/channel (WWG only)
         if channel_id in (config.ALERTS_THREAD_ID, config.ACTIVE_FUTURES_ID):
             await self._process_alerts(message)
         elif channel_id in (config.TRADES_THREAD_ID, config.ACTIVE_SPOT_ID):
-            await self._process_trade_signal(message, channel_name)
-        else:
-            # Autres channels: tenter le parsing generique
             await self._process_trade_signal(message, channel_name)
 
         # 3. Telecharger les images
@@ -251,6 +280,7 @@ class TradeListener(discord.Client):
             return None
 
     async def close(self):
+        order_monitor.stop()
         if self._http_session:
             await self._http_session.close()
         await binance_client.close()

@@ -156,6 +156,45 @@ async def get_trades_closed_today(today: str) -> list:
         return []
 
 
+async def delete_non_wwg_messages(wwg_channel_ids: set) -> int:
+    """Delete messages not from WWG channels. Returns count deleted."""
+    session = await _get_session()
+    # Get all distinct channel_ids first
+    url = f"{_BASE_URL}/messages?select=channel_id"
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                logger.error("Error reading messages: %s", await resp.text())
+                return 0
+            rows = await resp.json()
+
+        wwg_str = {str(cid) for cid in wwg_channel_ids}
+        non_wwg_ids = {r["channel_id"] for r in rows if r["channel_id"] not in wwg_str}
+
+        total_deleted = 0
+        for cid in non_wwg_ids:
+            del_url = f"{_BASE_URL}/messages?channel_id=eq.{cid}"
+            headers = {**_HEADERS, "Prefer": "return=representation"}
+            async with session.delete(del_url, headers=headers) as resp:
+                if resp.status == 200:
+                    deleted = await resp.json()
+                    count = len(deleted)
+                    total_deleted += count
+                    logger.info("Deleted %d messages from channel %s", count, cid)
+                else:
+                    logger.error("Error deleting channel %s messages: %s", cid, await resp.text())
+
+        return total_deleted
+    except Exception as e:
+        logger.error("Error cleaning non-WWG messages: %s", e)
+        return 0
+
+
+async def cancel_trade(trade_id: int) -> Optional[dict]:
+    """Cancel a trade by ID."""
+    return await update_trade(trade_id, {"status": "cancelled"})
+
+
 async def close():
     global _session
     if _session and not _session.closed:
