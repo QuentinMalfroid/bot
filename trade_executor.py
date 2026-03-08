@@ -1,6 +1,9 @@
 """Execute trades on Binance based on parsed Discord signals.
 
-Routes: LONG -> Spot, SHORT -> Futures.
+Routing by channel:
+- trades/active-alerts threads -> Futures (testnet.binancefuture.com)
+- spot channels -> Spot (demo-api.binance.com)
+
 Uses risk_manager for 1R-based dynamic position sizing.
 """
 import logging
@@ -16,6 +19,12 @@ logger = logging.getLogger(__name__)
 
 _BINANCE_QUOTE = "USDT"
 
+# Channel IDs that route to futures (trades + active-alerts threads)
+_FUTURES_CHANNEL_IDS = {
+    config.TRADES_THREAD_ID,
+    config.ALERTS_THREAD_ID,
+}
+
 
 def _to_binance_symbol(asset: str) -> str:
     """Convert asset name to Binance symbol (e.g. ETH -> ETHUSDT)."""
@@ -25,18 +34,29 @@ def _to_binance_symbol(asset: str) -> str:
     return f"{asset}{_BINANCE_QUOTE}"
 
 
-def _is_futures(direction: str) -> bool:
-    """SHORT trades go to futures, LONG trades go to spot."""
-    return direction == "SHORT"
+def _is_futures_channel(channel_id: Optional[int] = None, channel_name: str = "") -> bool:
+    """Determine if a channel routes to futures or spot.
+
+    trades/active-alerts -> futures
+    Everything else -> spot
+    """
+    if channel_id and channel_id in _FUTURES_CHANNEL_IDS:
+        return True
+    # Fallback: channel name heuristic
+    name_lower = channel_name.lower()
+    if "spot" in name_lower:
+        return False
+    return False
 
 
-async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id: str):
+async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id: str,
+                               channel_id: int = 0):
     """Execute a new trade signal on Binance with proper 1R risk management."""
     if not config.BINANCE_API_KEY:
         return
 
     symbol = _to_binance_symbol(trade.asset)
-    use_futures = _is_futures(trade.direction)
+    use_futures = _is_futures_channel(channel_id, channel_name)
 
     # Verify symbol exists
     if use_futures:
@@ -175,7 +195,7 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         )
 
 
-async def handle_alert(alert: TradeAlert):
+async def handle_alert(alert: TradeAlert, channel_id: int = 0):
     """Handle an active-alert by managing Binance orders accordingly."""
     if not config.BINANCE_API_KEY:
         return
@@ -190,6 +210,9 @@ async def handle_alert(alert: TradeAlert):
     if side == "SPOT":
         side = "LONG"
 
+    # Alerts thread is always futures
+    use_futures = _is_futures_channel(channel_id)
+
     for trader in alert.traders:
         existing = await supabase_client.find_open_trade(symbol, trader, side)
         if not existing:
@@ -200,7 +223,6 @@ async def handle_alert(alert: TradeAlert):
             continue
 
         trade_id = existing["id"]
-        use_futures = _is_futures(existing.get("side", "LONG"))
 
         if alert.event_type == "ep_filled":
             await _handle_ep_filled(existing, symbol, trade_id, use_futures)

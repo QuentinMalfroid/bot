@@ -151,7 +151,9 @@ class TradeListener(discord.Client):
             trade_dict["message_id"] = str(message.id)
             await database.save_parsed_trade(trade_dict)
             if channel_name not in trade_parser.CHANNELS_EXCLUDED_FROM_SUPABASE:
-                await trade_executor.execute_trade_signal(trade, channel_name, str(message.id))
+                await trade_executor.execute_trade_signal(
+                    trade, channel_name, str(message.id), channel_id=message.channel.id,
+                )
 
         for embed in message.embeds:
             embed_trade = trade_parser.parse_embed(embed.to_dict(), message.author.display_name)
@@ -160,7 +162,9 @@ class TradeListener(discord.Client):
                 embed_trade_dict["message_id"] = str(message.id)
                 await database.save_parsed_trade(embed_trade_dict)
                 if channel_name not in trade_parser.CHANNELS_EXCLUDED_FROM_SUPABASE:
-                    await trade_executor.execute_trade_signal(embed_trade, channel_name, str(message.id))
+                    await trade_executor.execute_trade_signal(
+                        embed_trade, channel_name, str(message.id), channel_id=message.channel.id,
+                    )
 
     async def _process_alerts(self, message: discord.Message):
         """Parse les alertes active-alerts, met a jour Supabase et gere les ordres Binance."""
@@ -219,7 +223,7 @@ class TradeListener(discord.Client):
                     )
 
             # Execute Binance actions for this alert
-            await trade_executor.handle_alert(alert)
+            await trade_executor.handle_alert(alert, channel_id=message.channel.id)
 
     async def _download_image(self, attachment: discord.Attachment, message_id: str) -> Path | None:
         try:
