@@ -100,7 +100,8 @@ async def _sync_trade(trade: dict):
             )
 
         elif binance_status == "CANCELED":
-            updates[f"{ep}_status"] = "cancelled"
+            updates[f"{ep}_status"] = None  # constraint only allows waiting/filled/null
+            updates[f"{ep}_id"] = None
             logger.info(
                 "ORDER_MONITOR: %s CANCELLED on Binance for trade #%s %s",
                 ep.upper(), trade_id, symbol,
@@ -141,7 +142,8 @@ async def _sync_trade(trade: dict):
                     f"{pnl:.2f}" if pnl is not None else "unknown",
                 )
             elif sl_binance_status == "CANCELED":
-                updates["sl_status"] = "cancelled"
+                updates["sl_status"] = None
+                updates["sl_id"] = None
                 logger.warning(
                     "ORDER_MONITOR: SL CANCELLED on Binance for trade #%s %s!",
                     trade_id, symbol,

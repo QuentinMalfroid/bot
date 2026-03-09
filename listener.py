@@ -106,6 +106,56 @@ class TradeListener(discord.Client):
             except Exception as e:
                 logger.warning("Could not join thread %s: %s", tid, e)
 
+    async def on_resumed(self):
+        """Called when the gateway resumes after a disconnect.
+
+        Discord does NOT replay missed messages on RESUME, so we must
+        catch up manually by fetching recent messages from our channels.
+        """
+        logger.warning("RECONNECT: Gateway resumed — fetching missed messages")
+        await self._catch_up_missed_messages()
+
+    async def _catch_up_missed_messages(self):
+        """Fetch recent messages from alert/trade channels to catch up after disconnect."""
+        channels_to_check = [
+            (config.ALERTS_THREAD_ID, self._process_alerts),
+            (config.TRADES_THREAD_ID, None),  # trades handled via _process_trade_signal
+        ]
+
+        for channel_id, handler in channels_to_check:
+            try:
+                channel = self.get_channel(channel_id)
+                if channel is None:
+                    channel = await self.fetch_channel(channel_id)
+                if channel is None:
+                    continue
+
+                # Fetch last 20 messages (covers ~30 min of activity)
+                messages = []
+                async for msg in channel.history(limit=20):
+                    messages.append(msg)
+
+                # Process in chronological order (oldest first)
+                messages.reverse()
+
+                processed = 0
+                for msg in messages:
+                    if msg.author.id == self.user.id:
+                        continue
+                    # Check if already in local DB (skip if already processed)
+                    if await database.message_exists(str(msg.id)):
+                        continue
+                    await self._process_message(msg)
+                    processed += 1
+
+                if processed > 0:
+                    logger.info(
+                        "RECONNECT: Processed %d missed messages from channel %s",
+                        processed, channel_id,
+                    )
+            except Exception as e:
+                logger.error("RECONNECT: Error catching up channel %s: %s", channel_id, e)
+
     async def on_message(self, message: discord.Message):
         if message.author.id == self.user.id:
             return
@@ -273,7 +323,7 @@ class TradeListener(discord.Client):
                         updates["ep2_status"] = "filled"
 
                 if alert.event_type in ("sl_to_be", "sl_moved"):
-                    updates["sl_status"] = "closed"
+                    # SL is being moved, not closed — keep status as waiting
                     if alert.new_sl_price:
                         updates["sl"] = alert.new_sl_price
 
@@ -283,7 +333,9 @@ class TradeListener(discord.Client):
                         updates[tp_key] = "filled"
                     # If TP + stops moved to BE (combined action)
                     if "stops moved to be" in (alert.action or "").lower():
-                        updates["sl_status"] = "closed"
+                        be_price = existing.get("ep1")
+                        if be_price:
+                            updates["sl"] = be_price
 
                 if alert.new_entry:
                     updates["ep1"] = alert.new_entry

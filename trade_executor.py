@@ -271,10 +271,8 @@ async def handle_alert(alert: TradeAlert, channel_id: int = 0):
             # If combined with "stops moved to be", move SL too
             if "stops moved to be" in (alert.action or "").lower():
                 await _handle_sl_to_be(existing, symbol, trade_id, use_futures)
-            logger.info(
-                "EXECUTOR: TP%s hit for trade #%s %s",
-                alert.tp_level, trade_id, symbol,
-            )
+            # Take partial profit on Binance
+            await _handle_tp_hit(existing, symbol, trade_id, alert.tp_level, use_futures)
 
         elif alert.event_type == "entry_updated" and alert.new_entry:
             logger.info(
@@ -452,7 +450,7 @@ async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures:
     """Move stop-loss to breakeven (entry price). Also cancel unfilled EP orders."""
     cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
 
-    # Cancel existing SL order
+    # Cancel existing SL order (if standard SL, not candle-based)
     if trade.get("sl_id") and trade.get("sl_status") == "waiting":
         await cancel_fn(symbol, int(trade["sl_id"]))
 
@@ -461,11 +459,27 @@ async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures:
         if trade.get(f"{ep}_status") == "waiting" and trade.get(f"{ep}_id"):
             order_id = int(trade[f"{ep}_id"])
             await cancel_fn(symbol, order_id)
-            await supabase_client.update_trade(trade_id, {f"{ep}_status": "cancelled"})
+            # Use None instead of "cancelled" (Supabase constraint)
+            await supabase_client.update_trade(trade_id, {f"{ep}_status": None, f"{ep}_id": None})
             logger.info("EXECUTOR: Cancelled %s order %s (SL→BE) for trade #%s", ep, order_id, trade_id)
 
     be_price = trade.get("ep1")
     if not be_price:
+        return
+
+    # For candle-based SL: update the candle monitor price instead of placing STOP_MARKET
+    if candle_monitor.is_watched(trade_id) or trade.get("sl_type") == "candle_2x5m":
+        candle_monitor.add_watch(
+            trade_id=trade_id,
+            symbol=symbol,
+            side=trade.get("side", "LONG"),
+            sl_price=float(be_price),
+        )
+        await supabase_client.update_trade(trade_id, {"sl": float(be_price)})
+        logger.info(
+            "EXECUTOR: Candle SL moved to BE for trade #%s %s @ %s",
+            trade_id, symbol, be_price,
+        )
         return
 
     total_qty = 0.0
@@ -491,6 +505,7 @@ async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures:
 
     if sl_order:
         await supabase_client.update_trade(trade_id, {
+            "sl": float(be_price),
             "sl_id": str(sl_order["orderId"]),
             "sl_status": "waiting",
         })
@@ -539,3 +554,112 @@ async def _handle_sl_move(trade: dict, symbol: str, trade_id: int,
             "EXECUTOR: SL moved to %s for trade #%s %s",
             new_price, trade_id, symbol,
         )
+
+
+async def _handle_tp_hit(trade: dict, symbol: str, trade_id: int,
+                          tp_level: int, use_futures: bool):
+    """Take partial profit when a TP level is hit.
+
+    Strategy: close 50% of remaining position on each TP hit.
+    This ensures we lock in profits progressively while letting the rest ride.
+    """
+    # Calculate remaining position quantity
+    total_qty = 0.0
+    for ep in ("ep1", "ep2", "ep3"):
+        if trade.get(f"{ep}_status") == "filled":
+            qty = trade.get(f"{ep}_size_crypto")
+            if qty:
+                total_qty += float(qty)
+
+    if total_qty <= 0:
+        logger.warning("EXECUTOR: TP%s hit but no filled qty for trade #%s", tp_level, trade_id)
+        return
+
+    # Check actual position on Binance
+    if use_futures:
+        position = await binance_client.futures_get_position(symbol)
+        if not position or float(position.get("positionAmt", 0)) == 0:
+            logger.warning("EXECUTOR: TP%s hit but no position on Binance for trade #%s", tp_level, trade_id)
+            return
+        pos_qty = abs(float(position["positionAmt"]))
+    else:
+        base_asset = symbol.replace("USDT", "")
+        pos_qty = await binance_client.get_balance(base_asset)
+        if pos_qty <= 0:
+            logger.warning("EXECUTOR: TP%s hit but no balance for trade #%s", tp_level, trade_id)
+            return
+
+    # Close 50% of current position
+    close_qty = pos_qty * 0.5
+
+    # Get symbol info for precision
+    if use_futures:
+        sym_info = await binance_client.futures_get_symbol_info(symbol)
+    else:
+        sym_info = await binance_client.get_symbol_info(symbol)
+
+    if sym_info:
+        # Round to symbol's step size
+        step_size = None
+        for f in sym_info.get("filters", []):
+            if f["filterType"] == "LOT_SIZE":
+                step_size = float(f["stepSize"])
+                break
+        if step_size and step_size > 0:
+            close_qty = int(close_qty / step_size) * step_size
+
+    if close_qty <= 0:
+        logger.info("EXECUTOR: TP%s close qty too small for trade #%s", tp_level, trade_id)
+        return
+
+    close_side = "SELL" if trade.get("side") == "LONG" else "BUY"
+
+    if use_futures:
+        result = await binance_client.futures_place_market_order(symbol, close_side, close_qty)
+    else:
+        result = await binance_client.place_market_order(symbol, close_side, quantity=close_qty)
+
+    if result:
+        remaining = pos_qty - close_qty
+        logger.info(
+            "EXECUTOR: TP%s TAKEN for trade #%s %s — closed %s, remaining %s",
+            tp_level, trade_id, symbol, close_qty, remaining,
+        )
+
+        # If position fully closed, close the trade
+        if remaining <= 0:
+            await supabase_client.update_trade(trade_id, {
+                "status": "closed",
+                "close_reason": "profit",
+            })
+            # Stop candle monitor if active
+            candle_monitor.remove_watch(trade_id)
+        else:
+            # Update SL order quantity to match remaining position
+            # (candle monitor handles this automatically since it reads position from Binance)
+            if not candle_monitor.is_watched(trade_id) and trade.get("sl_id"):
+                # For standard SL: cancel and re-place with new qty
+                cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
+                await cancel_fn(symbol, int(trade["sl_id"]))
+
+                sl_price = trade.get("sl")
+                if sl_price:
+                    sl_side = "SELL" if trade.get("side") == "LONG" else "BUY"
+                    if use_futures:
+                        sl_order = await binance_client.futures_place_stop_loss_order(
+                            symbol, sl_side, remaining, float(sl_price),
+                        )
+                    else:
+                        sl_order = await binance_client.place_stop_loss_order(
+                            symbol, sl_side, remaining, float(sl_price),
+                        )
+                    if sl_order:
+                        await supabase_client.update_trade(trade_id, {
+                            "sl_id": str(sl_order["orderId"]),
+                        })
+                        logger.info(
+                            "EXECUTOR: SL re-placed for remaining %s of trade #%s",
+                            remaining, trade_id,
+                        )
+    else:
+        logger.error("EXECUTOR: Failed to take TP%s for trade #%s %s", tp_level, trade_id, symbol)

@@ -72,6 +72,16 @@ async def init_db():
         logger.info("Base de donnees initialisee: %s", config.DATABASE_PATH)
 
 
+async def message_exists(discord_message_id: str) -> bool:
+    """Check if a message already exists in the database."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM raw_messages WHERE discord_message_id = ?",
+            (discord_message_id,),
+        )
+        return await cursor.fetchone() is not None
+
+
 async def save_raw_message(msg_data: dict):
     """Sauvegarde un message brut dans la base."""
     async with aiosqlite.connect(config.DATABASE_PATH) as db:
