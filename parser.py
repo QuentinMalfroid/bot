@@ -18,6 +18,7 @@ class TradeSignal:
     take_profit: Optional[float] = None
     risk_pct: Optional[float] = None
     pnl_pct: Optional[float] = None
+    sl_type: Optional[str] = None  # None = normal, "candle_2x5m" = 2x 5min candle close
     raw_signal: str = ""
 
     def to_dict(self):
@@ -55,7 +56,52 @@ def _parse_wwg_short_format(content: str, author_name: str) -> Optional[TradeSig
     Exemples:
         @WWG: Woods long eth 1864-1834 stop 1763
         @WWG: Eliz long wld 399-38 stop 357 pnl: +20%
+        @WWG: Muzzagin long btc 67800-66700 sl 2x 5 min stops below 65500
+        @WWG: Muzzagin short btc 93000-94400 stop 2x 5m＞96700
     """
+    # First try: candle-based SL ("stop/sl 2x 5m＜price" or "2x 5 min close below/above price")
+    # Handles both "long btc" and "btc long" and "btc limit long" orders
+    candle_pattern = (
+        r"@WWG:\s*(-?\w+)\s+"
+        r"(?:(\w+)\s+(?:limit\s+)?(long|short)|(long|short)\s+(\w+))\s+"  # asset+dir or dir+asset
+        r"([\d.]+)(?:\s*[-–]\s*([\d.]+))?(?:\s*[-–]\s*[\d.]+)?"  # entries (2 or 3)
+        r"\s+(?:stop|sl):?\s+2x\s*5\s*(?:m|min|minute)s?"
+        r"(?:\s*(?:stops?\s+)?(?:close\s+)?(below|above|[＜<>＞]))\s*([\d.]+)"
+        r"(?:\s+pnl:\s*([+-]?[\d.]+)%)?"
+    )
+    match = re.search(candle_pattern, content, re.IGNORECASE)
+    if match:
+        groups = match.groups()
+        trader = groups[0].lstrip("-").strip()
+        # Two alternatives: (asset, dir, None, None) or (None, None, dir, asset)
+        if groups[1]:  # "btc long" format
+            asset = groups[1]
+            direction = groups[2]
+        else:  # "long btc" format
+            direction = groups[3]
+            asset = groups[4]
+        price1 = groups[5]
+        price2 = groups[6]
+        comparator = groups[7]
+        sl_price = groups[8]
+        pnl = groups[9]
+
+        p1 = float(price1)
+        p2 = float(price2) if price2 else p1
+
+        return TradeSignal(
+            trader=trader,
+            direction=direction.upper(),
+            asset=asset.upper(),
+            order_type="LIMIT",
+            entry_low=min(p1, p2),
+            entry_high=max(p1, p2),
+            stop_loss=float(sl_price),
+            pnl_pct=float(pnl) if pnl else None,
+            sl_type="candle_2x5m",
+        )
+
+    # Standard format: @WWG: Trader long/short asset price stop price
     pattern = r"@WWG:\s*(-?\w+)\s+(long|short)\s+(\w+)\s+([\d.]+)(?:[-–]([\d.]+))?\s+stop\s+([\d.]+)(?:\s+pnl:\s*([+-]?[\d.]+)%)?"
     match = re.search(pattern, content, re.IGNORECASE)
     if not match:
@@ -186,7 +232,43 @@ def _parse_eth_limit_format(content: str, author_name: str) -> Optional[TradeSig
     Exemples:
         Eth limit 1864-1834 stop 1763
         Btc limit 65000-64500 stop 63000
+        eth limit short 2100 - 2150 sl 2x 5m close above 2196
     """
+    # First try: candle-based SL in limit format
+    candle_pattern = (
+        r"(\w+)\s+limit\s+(?:(long|short)\s+)?"
+        r"([\d.,]+)\s*[-–]\s*([\d.,]+)"
+        r"\s+(?:stop|sl)\s+2x\s*5\s*(?:m|min|minute)s?"
+        r"(?:\s*(?:stops?\s+)?(?:close\s+)?(below|above|[＜<>＞]))\s*([\d.,]+)"
+    )
+    match = re.search(candle_pattern, content, re.IGNORECASE)
+    if match:
+        asset, direction, price1, price2, comparator, sl_price = match.groups()
+        p1 = float(price1.replace(",", ""))
+        p2 = float(price2.replace(",", ""))
+        sl = float(sl_price.replace(",", ""))
+
+        if not direction:
+            avg_entry = (p1 + p2) / 2
+            direction = "LONG" if sl < avg_entry else "SHORT"
+        else:
+            direction = direction.upper()
+
+        trader_match = re.search(r"@WWG:\s*(-?\w+)", content)
+        trader = trader_match.group(1).lstrip("-").strip() if trader_match else author_name or None
+
+        return TradeSignal(
+            trader=trader,
+            direction=direction,
+            asset=asset.upper(),
+            order_type="LIMIT",
+            entry_low=min(p1, p2),
+            entry_high=max(p1, p2),
+            stop_loss=sl,
+            sl_type="candle_2x5m",
+        )
+
+    # Standard format
     pattern = r"(\w+)\s+limit\s+([\d.,]+)\s*[-–]\s*([\d.,]+)\s+stop\s+([\d.,]+)"
     match = re.search(pattern, content, re.IGNORECASE)
     if not match:
@@ -249,9 +331,10 @@ CHANNELS_EXCLUDED_FROM_SUPABASE = {"Coinbase"}
 
 # --- Active Alerts parsing ---
 
-# Map des actions vers (status, close_reason)
+# Map des actions vers (status, close_reason, event_type)
 _ACTION_MAP = {
     "limit order filled": ("open", None, "ep_filled"),
+    "limit order entered manually": ("open", None, "ep_filled"),
     "stopped out": ("closed", "stopped_out", None),
     "stopped be": ("closed", "breakeven", None),
     "closed be": ("closed", "breakeven", None),
@@ -260,6 +343,19 @@ _ACTION_MAP = {
     "closed in loss": ("closed", "loss", None),
     "limit order cancelled": ("cancelled", "cancelled", None),
     "stops moved to be": ("open", None, "sl_to_be"),
+}
+
+# Discord role ID -> trader name mapping (from Trader News server)
+_ROLE_TO_TRADER = {
+    "1301066789769314315": "Johnny",
+    "1301069806312755233": "Tareeq",
+    "1301085291700027392": "Muzzagin",
+    "1301096664798593035": "Eliz",
+    "1301145587495997501": "Woods",
+    "1301173691786465282": "Michele",
+    "1301174359993618483": "Bryce",
+    "1304490008828313651": "JDrip",
+    "1305561685582676085": "Dieta",
 }
 
 
@@ -272,9 +368,13 @@ class TradeAlert:
     # Derived from action
     new_status: Optional[str] = None  # open / closed / cancelled
     close_reason: Optional[str] = None
-    event_type: Optional[str] = None  # ep_filled / sl_to_be / None
+    event_type: Optional[str] = None  # ep_filled / sl_to_be / sl_moved / tp_hit / entry_updated
     # For "Updated Average Entry to X"
     new_entry: Optional[float] = None
+    # For "Stops moved to <price>"
+    new_sl_price: Optional[float] = None
+    # For "TP1", "TP2", etc.
+    tp_level: Optional[int] = None  # 1, 2, 3...
     # Link to original trades message (for TP extraction)
     linked_message_id: Optional[str] = None
     linked_channel_id: Optional[str] = None
@@ -366,18 +466,45 @@ def parse_alert_message(content: str) -> List[TradeAlert]:
 
 
 def _parse_single_alert(line: str) -> Optional[TradeAlert]:
-    """Parse une seule ligne d'alerte active."""
-    # Pattern: :<Side>: <ASSET> ...trades: <action> @WWG: <trader>
-    pattern = r":(Long|Short|Spot):\s*(\w+)\s.*?trades:\s*(.+?)(?:\s*@WWG:\s*(.+))$"
-    match = re.search(pattern, line, re.IGNORECASE)
+    """Parse une seule ligne d'alerte active.
+
+    Real format from WG Bot:
+      :Long: **BTC** https://discord.com/channels/.../...: Limit order filled <@&role_id>, <@&role_id2>
+      :Short: **ETH** https://discord.com/channels/.../...: Stopped out <@&role_id>
+    Legacy format (if any):
+      :Long: BTC ...trades: <action> @WWG: <trader>
+    """
+    # --- Try new format first: :<Side>: **ASSET** <url>: <action> <@&role_id>... ---
+    new_pattern = (
+        r":(Long|Short|Spot):\s*\*{0,2}(\w+)\*{0,2}\s+"
+        r"https://discord\.com/channels/\d+/(\d+)/(\d+):\s*"
+        r"(.+?)\s*(<@&.+)$"
+    )
+    match = re.search(new_pattern, line, re.IGNORECASE)
+    if match:
+        direction, asset, linked_ch_id, linked_msg_id, action_raw, roles_raw = match.groups()
+        action = action_raw.strip()
+
+        # Extract trader names from role mentions <@&id>
+        traders = []
+        for role_id in re.findall(r"<@&(\d+)>", roles_raw):
+            name = _ROLE_TO_TRADER.get(role_id)
+            if name:
+                traders.append(name)
+            else:
+                logger.warning("Unknown role ID in active-alerts: %s", role_id)
+
+        return _build_alert(direction, asset, action, traders, linked_ch_id, linked_msg_id)
+
+    # --- Fallback: legacy format with @WWG: trader ---
+    legacy_pattern = r":(Long|Short|Spot):\s*\*{0,2}(\w+)\*{0,2}\s.*?trades:\s*(.+?)(?:\s*@WWG:\s*(.+))$"
+    match = re.search(legacy_pattern, line, re.IGNORECASE)
     if not match:
         return None
 
     direction, asset, action_raw, traders_raw = match.groups()
     action = action_raw.strip()
-    action_lower = action.lower()
 
-    # Parse traders (peut etre "trader1, @WWG: trader2, @WWG: trader3")
     traders = []
     if traders_raw:
         for t in re.split(r",\s*(?:@WWG:\s*)?", traders_raw):
@@ -385,12 +512,30 @@ def _parse_single_alert(line: str) -> Optional[TradeAlert]:
             if name:
                 traders.append(name)
 
-    # Determiner le status et close_reason
+    # Extract linked message from URL if present
+    linked_ch_id = None
+    linked_msg_id = None
+    link = extract_message_link(line)
+    if link:
+        linked_ch_id = link[1]
+        linked_msg_id = link[2]
+
+    return _build_alert(direction, asset, action, traders, linked_ch_id, linked_msg_id)
+
+
+def _build_alert(direction: str, asset: str, action: str, traders: list,
+                 linked_ch_id: Optional[str], linked_msg_id: Optional[str]) -> Optional[TradeAlert]:
+    """Build a TradeAlert from parsed components."""
+    action_lower = action.lower()
+
     new_status = None
     close_reason = None
     event_type = None
     new_entry = None
+    new_sl_price = None
+    tp_level = None
 
+    # Check standard action map
     for key, (status, reason, evt) in _ACTION_MAP.items():
         if action_lower.startswith(key):
             new_status = status
@@ -398,24 +543,34 @@ def _parse_single_alert(line: str) -> Optional[TradeAlert]:
             event_type = evt
             break
 
-    # Cas special: Updated Average Entry to X
+    # TP hit: "TP1", "TP2", "TP1 & stops moved to BE", "TP1 hit & stops moved to BE"
+    tp_match = re.match(r"tp(\d+)", action_lower)
+    if tp_match:
+        tp_level = int(tp_match.group(1))
+        new_status = "open"
+        event_type = "tp_hit"
+        # If combined with "stops moved to be"
+        if "stops moved to be" in action_lower:
+            # tp_hit + sl_to_be handled together in executor
+            pass
+
+    # Updated Average Entry to X
     entry_match = re.search(r"updated average entry to ([\d.]+)", action_lower)
     if entry_match:
         new_entry = float(entry_match.group(1))
         new_status = "open"
         event_type = "entry_updated"
 
-    if not new_status and not new_entry:
+    # Stops moved to <price> (not BE)
+    sl_move_match = re.search(r"stops moved to ([\d.]+)", action_lower)
+    if sl_move_match:
+        new_sl_price = float(sl_move_match.group(1))
+        new_status = "open"
+        event_type = "sl_moved"
+
+    if not new_status and not new_entry and tp_level is None:
         logger.warning("Action non reconnue dans active-alerts: %s", action)
         return None
-
-    # Extract linked message ID from Discord URL in the line
-    linked_msg_id = None
-    linked_ch_id = None
-    link = extract_message_link(line)
-    if link:
-        linked_ch_id = link[1]
-        linked_msg_id = link[2]
 
     return TradeAlert(
         direction=direction.upper(),
@@ -426,6 +581,8 @@ def _parse_single_alert(line: str) -> Optional[TradeAlert]:
         close_reason=close_reason,
         event_type=event_type,
         new_entry=new_entry,
+        new_sl_price=new_sl_price,
+        tp_level=tp_level,
         linked_message_id=linked_msg_id,
         linked_channel_id=linked_ch_id,
     )

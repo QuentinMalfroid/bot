@@ -58,9 +58,11 @@ class TradeListener(discord.Client):
             config.ACTIVE_FUTURES_ID, config.ACTIVE_SPOT_ID,
         )
 
-        # Start Binance order monitor
+        # Start Binance order monitor + restore candle SL watches
         if config.BINANCE_API_KEY:
             asyncio.create_task(order_monitor.start())
+            import candle_monitor
+            asyncio.create_task(candle_monitor.restore_watches())
 
     async def _build_role_map(self, guilds: list):
         """Build a mapping of role IDs to trader names from WWG roles."""

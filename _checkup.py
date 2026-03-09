@@ -1,0 +1,602 @@
+"""CryptoBot check-up script — run periodically to verify consistency.
+
+This script is the safety net: it catches anything the real-time listener missed.
+It parses recent Discord alerts, reconciles Supabase with Binance, and auto-corrects.
+"""
+import asyncio
+import re
+import os
+import aiohttp
+from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
+
+load_dotenv()
+
+import config
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = "1265052061976891454"
+CHANNELS = {
+    "trades": str(config.TRADES_THREAD_ID),
+    "alerts": str(config.ALERTS_THREAD_ID),
+    "futures": str(config.ACTIVE_FUTURES_ID),
+    "spot": str(config.ACTIVE_SPOT_ID),
+}
+SUPA_URL = os.getenv("SUPABASE_URL")
+SUPA_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+
+async def main():
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=35)
+    headers = {"Authorization": TOKEN}
+    supa_h = {
+        "apikey": SUPA_KEY,
+        "Authorization": f"Bearer {SUPA_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    import binance_client
+    import parser as trade_parser
+
+    async with aiohttp.ClientSession() as s:
+        # ── 1. Role map ──
+        async with s.get(
+            f"https://discord.com/api/v9/guilds/{GUILD_ID}/roles", headers=headers
+        ) as r:
+            roles = await r.json()
+        role_map = {}
+        for role in roles:
+            if role["name"].startswith("WWG: "):
+                trader = role["name"].removeprefix("WWG: ").lstrip("-").strip()
+                role_map[role["id"]] = trader
+
+        def resolve(content):
+            def repl(m):
+                rid = m.group(1)
+                return f"@WWG: {role_map[rid]}" if rid in role_map else m.group(0)
+            return re.sub(r"<@&(\d+)>", repl, content or "")
+
+        # ── 2. Fetch Discord messages ──
+        discord_data = {}
+        for name, ch_id in CHANNELS.items():
+            url = f"https://discord.com/api/v9/channels/{ch_id}/messages?limit=20"
+            async with s.get(url, headers=headers) as r:
+                if r.status == 200:
+                    msgs = await r.json()
+                    recent = []
+                    for m in msgs:
+                        try:
+                            t = datetime.fromisoformat(m["timestamp"])
+                            if t > cutoff:
+                                recent.append(m)
+                        except Exception:
+                            pass
+                    discord_data[name] = {"all": msgs, "recent": recent}
+                    print(f"Discord {name}: {len(recent)} new / {len(msgs)} total")
+
+        # ── 3. Supabase open trades ──
+        async with s.get(
+            f"{SUPA_URL}/rest/v1/trades?status=eq.open&order=created_at.desc",
+            headers=supa_h,
+        ) as r:
+            trades = await r.json()
+        print(f"Supabase: {len(trades)} open trades")
+
+        for t in trades:
+            print(
+                f"  #{t['id']} {t['symbol']} {t['side']} trader={t['trader']} "
+                f"ep1={t.get('ep1')}({t.get('ep1_status')}) "
+                f"ep2={t.get('ep2')}({t.get('ep2_status')}) "
+                f"sl={t.get('sl')} sl_id={t.get('sl_id')}"
+            )
+
+        corrections = []
+
+        # Helper to update Supabase
+        async def supa_patch(trade_id, updates):
+            async with s.patch(
+                f"{SUPA_URL}/rest/v1/trades?id=eq.{trade_id}",
+                headers=supa_h,
+                json=updates,
+            ) as r2:
+                return await r2.json()
+
+        # Helper to find matching open trade
+        def find_trade(symbol, trader, side):
+            for t in trades:
+                if (t["symbol"] == symbol
+                    and t.get("trader") == trader
+                    and t.get("side") == side
+                    and t.get("status") == "open"):
+                    return t
+            return None
+
+        # ── 4. PROCESS RECENT ALERTS (the critical missing piece!) ──
+        for msg in discord_data.get("alerts", {}).get("recent", []):
+            content = resolve(msg.get("content", ""))
+            if not content:
+                continue
+
+            parsed_alerts = trade_parser.parse_alert_message(content)
+            for alert in parsed_alerts:
+                if not alert.traders or not alert.asset:
+                    continue
+
+                symbol = alert.asset.upper()
+                if not symbol.endswith("USDT"):
+                    symbol = f"{symbol}USDT"
+                side = alert.direction
+                if side == "SPOT":
+                    side = "LONG"
+
+                for trader in alert.traders:
+                    existing = find_trade(symbol, trader, side)
+                    if not existing:
+                        continue
+
+                    trade_id = existing["id"]
+                    use_futures = "spot" not in (existing.get("source_channel") or "").lower()
+
+                    # ── SL moved to BE ──
+                    if alert.event_type == "sl_to_be":
+                        be_price = existing.get("ep1")
+                        if not be_price:
+                            continue
+
+                        # Cancel old SL on Binance
+                        if existing.get("sl_id") and existing.get("sl_status") == "waiting":
+                            try:
+                                if use_futures:
+                                    await binance_client.futures_cancel_order(symbol, int(existing["sl_id"]))
+                                else:
+                                    await binance_client.cancel_order(symbol, int(existing["sl_id"]))
+                            except Exception as e:
+                                print(f"  Could not cancel old SL: {e}")
+
+                        # Calculate total filled qty
+                        total_qty = 0.0
+                        for ep in ("ep1", "ep2", "ep3"):
+                            if existing.get(f"{ep}_status") == "filled":
+                                qty = existing.get(f"{ep}_size_crypto")
+                                if qty:
+                                    total_qty += float(qty)
+
+                        if total_qty > 0:
+                            sl_side = "SELL" if side == "LONG" else "BUY"
+                            if use_futures:
+                                sl_order = await binance_client.futures_place_stop_loss_order(
+                                    symbol, sl_side, total_qty, float(be_price),
+                                )
+                            else:
+                                sl_order = await binance_client.place_stop_loss_order(
+                                    symbol, sl_side, total_qty, float(be_price),
+                                )
+
+                            if sl_order:
+                                await supa_patch(trade_id, {
+                                    "sl": float(be_price),
+                                    "sl_id": str(sl_order["orderId"]),
+                                    "sl_status": "waiting",
+                                })
+                                corrections.append(
+                                    f"Trade #{trade_id} {symbol} SL moved to BE @ {be_price}"
+                                )
+                        else:
+                            # No position, just update Supabase
+                            await supa_patch(trade_id, {
+                                "sl": float(be_price),
+                                "sl_status": "closed",
+                            })
+                            corrections.append(
+                                f"Trade #{trade_id} {symbol} SL updated to BE (no position)"
+                            )
+
+                    # ── SL moved to specific price ──
+                    elif alert.event_type == "sl_moved" and alert.new_sl_price:
+                        if existing.get("sl_id") and existing.get("sl_status") == "waiting":
+                            try:
+                                if use_futures:
+                                    await binance_client.futures_cancel_order(symbol, int(existing["sl_id"]))
+                                else:
+                                    await binance_client.cancel_order(symbol, int(existing["sl_id"]))
+                            except Exception as e:
+                                print(f"  Could not cancel old SL: {e}")
+
+                        total_qty = 0.0
+                        for ep in ("ep1", "ep2", "ep3"):
+                            if existing.get(f"{ep}_status") == "filled":
+                                qty = existing.get(f"{ep}_size_crypto")
+                                if qty:
+                                    total_qty += float(qty)
+
+                        if total_qty > 0:
+                            sl_side = "SELL" if side == "LONG" else "BUY"
+                            if use_futures:
+                                sl_order = await binance_client.futures_place_stop_loss_order(
+                                    symbol, sl_side, total_qty, alert.new_sl_price,
+                                )
+                            else:
+                                sl_order = await binance_client.place_stop_loss_order(
+                                    symbol, sl_side, total_qty, alert.new_sl_price,
+                                )
+
+                            if sl_order:
+                                await supa_patch(trade_id, {
+                                    "sl": alert.new_sl_price,
+                                    "sl_id": str(sl_order["orderId"]),
+                                    "sl_status": "waiting",
+                                })
+                                corrections.append(
+                                    f"Trade #{trade_id} {symbol} SL moved to {alert.new_sl_price}"
+                                )
+
+                    # ── Trade closed (stopped out, profit, cancelled, etc.) ──
+                    elif alert.new_status in ("closed", "cancelled"):
+                        updates = {"status": alert.new_status}
+                        if alert.close_reason:
+                            updates["close_reason"] = alert.close_reason
+
+                        # Cancel all open orders on Binance
+                        for ep in ("ep1", "ep2", "ep3"):
+                            oid = existing.get(f"{ep}_id")
+                            if oid and existing.get(f"{ep}_status") == "waiting":
+                                try:
+                                    if use_futures:
+                                        await binance_client.futures_cancel_order(symbol, int(oid))
+                                    else:
+                                        await binance_client.cancel_order(symbol, int(oid))
+                                    updates[f"{ep}_status"] = "cancelled"
+                                except Exception:
+                                    pass
+
+                        # Cancel SL
+                        if existing.get("sl_id") and existing.get("sl_status") == "waiting":
+                            try:
+                                if use_futures:
+                                    await binance_client.futures_cancel_order(symbol, int(existing["sl_id"]))
+                                else:
+                                    await binance_client.cancel_order(symbol, int(existing["sl_id"]))
+                                updates["sl_status"] = "cancelled"
+                            except Exception:
+                                pass
+
+                        # Close position on Binance if any
+                        pos = await binance_client.futures_get_position(symbol) if use_futures else None
+                        if pos and float(pos.get("positionAmt", 0)) != 0:
+                            amt = abs(float(pos["positionAmt"]))
+                            close_side = "SELL" if float(pos["positionAmt"]) > 0 else "BUY"
+                            if use_futures:
+                                await binance_client.futures_place_market_order(symbol, close_side, amt)
+                            corrections.append(
+                                f"Trade #{trade_id} {symbol} position closed on Binance"
+                            )
+
+                        await supa_patch(trade_id, updates)
+                        corrections.append(
+                            f"Trade #{trade_id} {symbol} -> {alert.new_status} ({alert.close_reason})"
+                        )
+
+                    # ── EP filled ──
+                    elif alert.event_type == "ep_filled":
+                        for ep in ("ep1", "ep2", "ep3"):
+                            if existing.get(f"{ep}_status") == "waiting":
+                                updates = {f"{ep}_status": "filled"}
+                                # Check actual order on Binance for fill details
+                                oid = existing.get(f"{ep}_id")
+                                if oid and use_futures:
+                                    try:
+                                        order = await binance_client.futures_get_order(symbol, int(oid))
+                                        if order and order.get("status") == "FILLED":
+                                            qty = float(order.get("executedQty", 0))
+                                            price = float(order.get("avgPrice", 0)) or existing.get(ep)
+                                            updates[f"{ep}_size_crypto"] = qty
+                                            updates[f"{ep}_size_usdt"] = qty * price
+                                    except Exception:
+                                        pass
+                                await supa_patch(trade_id, updates)
+                                corrections.append(
+                                    f"Trade #{trade_id} {symbol} {ep} -> filled (alert)"
+                                )
+                                break
+
+                    # ── TP hit ──
+                    elif alert.event_type == "tp_hit" and alert.tp_level:
+                        tp_key = f"tp{alert.tp_level}_status"
+                        updates = {tp_key: "filled"}
+                        # If combined with "stops moved to be"
+                        if "stops moved to be" in (alert.action or "").lower():
+                            be_price = existing.get("ep1")
+                            if be_price:
+                                # Cancel old SL and place new one at BE
+                                if existing.get("sl_id") and existing.get("sl_status") == "waiting":
+                                    try:
+                                        if use_futures:
+                                            await binance_client.futures_cancel_order(symbol, int(existing["sl_id"]))
+                                        else:
+                                            await binance_client.cancel_order(symbol, int(existing["sl_id"]))
+                                    except Exception:
+                                        pass
+
+                                total_qty = 0.0
+                                for ep in ("ep1", "ep2", "ep3"):
+                                    if existing.get(f"{ep}_status") == "filled":
+                                        qty = existing.get(f"{ep}_size_crypto")
+                                        if qty:
+                                            total_qty += float(qty)
+
+                                if total_qty > 0:
+                                    sl_side = "SELL" if side == "LONG" else "BUY"
+                                    if use_futures:
+                                        sl_order = await binance_client.futures_place_stop_loss_order(
+                                            symbol, sl_side, total_qty, float(be_price),
+                                        )
+                                    else:
+                                        sl_order = await binance_client.place_stop_loss_order(
+                                            symbol, sl_side, total_qty, float(be_price),
+                                        )
+                                    if sl_order:
+                                        updates["sl"] = float(be_price)
+                                        updates["sl_id"] = str(sl_order["orderId"])
+                                        updates["sl_status"] = "waiting"
+                                        corrections.append(
+                                            f"Trade #{trade_id} {symbol} SL moved to BE @ {be_price} (TP{alert.tp_level} hit)"
+                                        )
+
+                        await supa_patch(trade_id, updates)
+                        corrections.append(
+                            f"Trade #{trade_id} {symbol} TP{alert.tp_level} -> filled"
+                        )
+
+        # ── 5. Verify EP statuses on Binance ──
+        for t in trades:
+            if t.get("status") != "open":
+                continue
+            symbol = t["symbol"]
+            for ep in ("ep1", "ep2", "ep3"):
+                oid = t.get(f"{ep}_id")
+                if not oid:
+                    continue
+                try:
+                    use_futures = "spot" not in (t.get("source_channel") or "").lower()
+                    if use_futures:
+                        order = await binance_client.futures_get_order(symbol, int(oid))
+                    else:
+                        order = await binance_client.get_order(symbol, int(oid))
+                    if not order:
+                        continue
+                    bs = order.get("status")
+                    ss = t.get(f"{ep}_status")
+                    if bs == "FILLED" and ss != "filled":
+                        qty = float(order.get("executedQty", 0))
+                        price = float(order.get("avgPrice", 0)) or t.get(ep)
+                        updates = {
+                            f"{ep}_status": "filled",
+                            f"{ep}_size_crypto": qty,
+                            f"{ep}_size_usdt": qty * price,
+                        }
+                        await supa_patch(t["id"], updates)
+                        corrections.append(
+                            f"Trade #{t['id']} {symbol} {ep} -> filled (qty={qty})"
+                        )
+
+                        # If EP just filled, check if SL needs to be placed
+                        if not t.get("sl_id") and t.get("sl"):
+                            sl_side = "SELL" if t.get("side") == "LONG" else "BUY"
+                            if use_futures:
+                                await binance_client.futures_setup_symbol(symbol, 5, "ISOLATED")
+                                sl_order = await binance_client.futures_place_stop_loss_order(
+                                    symbol, sl_side, qty, float(t["sl"]),
+                                )
+                            else:
+                                sl_order = await binance_client.place_stop_loss_order(
+                                    symbol, sl_side, qty, float(t["sl"]),
+                                )
+                            if sl_order:
+                                await supa_patch(t["id"], {
+                                    "sl_id": str(sl_order["orderId"]),
+                                    "sl_status": "waiting",
+                                })
+                                corrections.append(
+                                    f"Trade #{t['id']} {symbol} SL placed @ {t['sl']}"
+                                )
+
+                    elif bs == "CANCELED" and ss != "cancelled":
+                        await supa_patch(t["id"], {f"{ep}_status": "cancelled"})
+                        corrections.append(
+                            f"Trade #{t['id']} {symbol} {ep} -> cancelled"
+                        )
+                except Exception as e:
+                    print(f"  EP check error #{t['id']} {ep}: {e}")
+
+        # ── 6. Check positions vs Supabase + fix leverage/margin ──
+        symbols = set(t["symbol"] for t in trades if t.get("status") == "open")
+        for symbol in symbols:
+            pos = await binance_client.futures_get_position(symbol)
+            amt = float(pos.get("positionAmt", 0)) if pos else 0
+            leverage = pos.get("leverage") if pos else None
+            margin = pos.get("marginType") if pos else None
+
+            if amt != 0:
+                print(
+                    f"  Binance {symbol}: amt={amt} leverage={leverage} margin={margin}"
+                )
+                if (leverage and int(leverage) != 5) or (margin and margin != "isolated"):
+                    await binance_client.futures_setup_symbol(symbol, 5, "ISOLATED")
+                    corrections.append(
+                        f"Trade {symbol}: fixed leverage/margin to 5x ISOLATED"
+                    )
+            else:
+                print(f"  Binance {symbol}: no position")
+
+        # ── 7. Check SL for filled positions — AUTO-PLACE if missing ──
+        # Re-fetch trades since we may have updated them
+        async with s.get(
+            f"{SUPA_URL}/rest/v1/trades?status=eq.open&order=created_at.desc",
+            headers=supa_h,
+        ) as r:
+            trades = await r.json()
+
+        for t in trades:
+            symbol = t["symbol"]
+            use_futures = "spot" not in (t.get("source_channel") or "").lower()
+            has_filled = any(
+                t.get(f"{ep}_status") == "filled" for ep in ("ep1", "ep2", "ep3")
+            )
+
+            if not has_filled or not t.get("sl"):
+                continue
+
+            # Check if SL order exists on Binance
+            sl_exists = False
+            if t.get("sl_id"):
+                try:
+                    if use_futures:
+                        sl_order = await binance_client.futures_get_order(symbol, int(t["sl_id"]))
+                    else:
+                        sl_order = await binance_client.get_order(symbol, int(t["sl_id"]))
+                    if sl_order and sl_order.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                        sl_exists = True
+                    elif sl_order and sl_order.get("status") == "FILLED":
+                        # SL was triggered — close the trade
+                        await supa_patch(t["id"], {
+                            "status": "closed",
+                            "close_reason": "stopped_out",
+                            "sl_status": "filled",
+                        })
+                        corrections.append(
+                            f"Trade #{t['id']} {symbol} SL triggered -> closed (stopped_out)"
+                        )
+                        continue
+                except Exception:
+                    pass
+
+            if not sl_exists:
+                # Check if there's actually a position
+                pos = await binance_client.futures_get_position(symbol) if use_futures else None
+                if pos and float(pos.get("positionAmt", 0)) != 0:
+                    total_qty = abs(float(pos["positionAmt"]))
+                    sl_side = "SELL" if t.get("side") == "LONG" else "BUY"
+                    sl_price = float(t["sl"])
+
+                    if use_futures:
+                        sl_order = await binance_client.futures_place_stop_loss_order(
+                            symbol, sl_side, total_qty, sl_price,
+                        )
+                    else:
+                        sl_order = await binance_client.place_stop_loss_order(
+                            symbol, sl_side, total_qty, sl_price,
+                        )
+
+                    if sl_order:
+                        await supa_patch(t["id"], {
+                            "sl_id": str(sl_order["orderId"]),
+                            "sl_status": "waiting",
+                        })
+                        corrections.append(
+                            f"Trade #{t['id']} {symbol} SL AUTO-PLACED @ {sl_price}"
+                        )
+                    else:
+                        corrections.append(
+                            f"WARN: Trade #{t['id']} {symbol} FAILED to place SL @ {sl_price}!"
+                        )
+
+        # ── 8. Check trader names ──
+        for t in trades:
+            if t.get("trader") == "Wealth Group":
+                msg_id = t.get("discord_message_id")
+                if msg_id:
+                    ch_id = CHANNELS["trades"]
+                    url = f"https://discord.com/api/v9/channels/{ch_id}/messages?around={msg_id}&limit=3"
+                    async with s.get(url, headers=headers) as r:
+                        msgs = await r.json()
+                    for m in msgs:
+                        if m["id"] == msg_id:
+                            resolved = resolve(m.get("content", ""))
+                            trader_match = re.search(r"@WWG:\s*(\w+)", resolved)
+                            if trader_match:
+                                new_name = trader_match.group(1)
+                                await supa_patch(t["id"], {"trader": new_name})
+                                corrections.append(
+                                    f"Trade #{t['id']} trader: Wealth Group -> {new_name}"
+                                )
+
+        # ── 9. TP search in embeds + update Supabase ──
+        for msg in discord_data.get("trades", {}).get("all", []):
+            if msg["author"]["username"] != "WG Bot":
+                continue
+            for embed in msg.get("embeds", []):
+                desc = embed.get("description", "") or ""
+                tp_match = re.search(r"\*\*TPs?:\*\*\s*(.+)", desc)
+                if not tp_match:
+                    continue
+                dir_match = re.search(r":(Long|Short):\s*\*\*(\w+)\*\*", desc)
+                if not dir_match:
+                    continue
+                direction = dir_match.group(1).upper()
+                asset = dir_match.group(2).upper()
+                symbol = f"{asset}USDT" if not asset.endswith("USDT") else asset
+
+                tp_section = tp_match.group(1)
+                prices, hits = [], []
+                for part in tp_section.split("|"):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    is_hit = "\u2713" in part or "\u2705" in part
+                    num = re.search(r"([\d.]+)", part)
+                    if num:
+                        prices.append(float(num.group(1)))
+                        hits.append(is_hit)
+
+                if not prices:
+                    continue
+
+                for t in trades:
+                    if t["symbol"] == symbol and t.get("side") == direction:
+                        tp_updates = {}
+                        for i, (price, hit) in enumerate(zip(prices, hits)):
+                            tp_num = i + 1
+                            if tp_num > 6:
+                                break
+                            key = f"tp{tp_num}"
+                            if t.get(key) != price:
+                                tp_updates[key] = price
+                            if hit and t.get(f"{key}_status") != "filled":
+                                tp_updates[f"{key}_status"] = "filled"
+                            elif not hit and not t.get(f"{key}_status"):
+                                tp_updates[f"{key}_status"] = "waiting"
+
+                        if tp_updates:
+                            await supa_patch(t["id"], tp_updates)
+                            corrections.append(
+                                f"Trade #{t['id']} {symbol} TPs updated: {tp_updates}"
+                            )
+
+        # ── 10. Risk summary ──
+        bal = await binance_client.futures_get_balance("USDT")
+        tradeable = bal * 0.8
+        risk_1r = tradeable * 0.01
+        total_risk = sum(float(t.get("risk_usdt") or 0) for t in trades)
+
+        print(
+            f"\nRISK: Balance={bal:.0f} 1R={risk_1r:.2f} "
+            f"TotalRisk={total_risk:.2f} ({total_risk / risk_1r:.1f}R)"
+            if risk_1r > 0 else f"\nRISK: Balance={bal:.0f}"
+        )
+
+        if risk_1r > 0 and total_risk / risk_1r > 3:
+            print("  WARNING: Total risk exceeds 3R!")
+
+        if corrections:
+            print(f"\n{len(corrections)} CORRECTIONS APPLIED:")
+            for c in corrections:
+                print(f"  - {c}")
+        else:
+            print("\nNO CORRECTIONS NEEDED - all consistent")
+
+        await binance_client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

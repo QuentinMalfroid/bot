@@ -114,6 +114,12 @@ async def get_open_trades(symbol: Optional[str] = None) -> list:
         return []
 
 
+async def has_open_trade_on_symbol(symbol: str, side: str) -> bool:
+    """Check if there's already an open trade on this symbol+side (any trader)."""
+    trades = await get_open_trades(symbol)
+    return any(t.get("side") == side for t in trades)
+
+
 async def insert_message(msg_data: dict) -> Optional[dict]:
     """Insere un message brut dans la table messages Supabase."""
     session = await _get_session()

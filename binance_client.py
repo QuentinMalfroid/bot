@@ -220,7 +220,11 @@ async def futures_place_stop_loss_order(
     quantity: float,
     stop_price: float,
 ) -> Optional[dict]:
-    """Place a futures STOP_MARKET order (SL protection)."""
+    """Place a futures STOP_MARKET order via Algo Order API (SL protection).
+
+    Since Dec 2025, conditional orders (STOP_MARKET, TAKE_PROFIT_MARKET, etc.)
+    must use POST /fapi/v1/algoOrder with algoType=CONDITIONAL.
+    """
     symbol_info = await futures_get_symbol_info(symbol)
     if not symbol_info:
         return None
@@ -232,28 +236,51 @@ async def futures_place_stop_loss_order(
     sp = _round_price(stop_price, pf["tick_size"])
 
     params = {
+        "algoType": "CONDITIONAL",
         "symbol": symbol,
         "side": side,
         "type": "STOP_MARKET",
-        "stopPrice": f"{sp}",
+        "triggerPrice": f"{sp}",
         "quantity": f"{qty}",
         "closePosition": "false",
+        "workingType": "CONTRACT_PRICE",
     }
-    result = await _request("POST", "/fapi/v1/order", params, base_url=FUTURES_BASE)
+    result = await _request("POST", "/fapi/v1/algoOrder", params, base_url=FUTURES_BASE)
     if result:
+        # Algo orders return algoId instead of orderId
+        algo_id = result.get("algoId") or result.get("orderId")
         logger.info(
-            "BINANCE FUTURES: SL %s %s qty=%s stop=%s -> orderId=%s",
-            side, symbol, qty, sp, result.get("orderId"),
+            "BINANCE FUTURES: SL %s %s qty=%s trigger=%s -> algoId=%s",
+            side, symbol, qty, sp, algo_id,
         )
+        # Normalize response to include orderId for compatibility
+        if "algoId" in result and "orderId" not in result:
+            result["orderId"] = result["algoId"]
+    return result
+
+
+async def futures_cancel_algo_order(algo_id: int) -> Optional[dict]:
+    """Cancel a futures algo/conditional order."""
+    result = await _request("DELETE", "/fapi/v1/algoOrder", {
+        "algoId": algo_id,
+    }, base_url=FUTURES_BASE)
+    if result:
+        logger.info("BINANCE FUTURES: Cancelled algo order %s", algo_id)
     return result
 
 
 async def futures_cancel_order(symbol: str, order_id: int) -> Optional[dict]:
-    """Cancel a futures order."""
+    """Cancel a futures order (standard or algo).
+
+    Tries standard cancel first, falls back to algo cancel.
+    """
     result = await _request("DELETE", "/fapi/v1/order", {
         "symbol": symbol,
         "orderId": order_id,
     }, base_url=FUTURES_BASE)
+    if not result:
+        # Might be an algo order, try algo cancel
+        result = await futures_cancel_algo_order(order_id)
     if result:
         logger.info("BINANCE FUTURES: Cancelled order %s on %s", order_id, symbol)
     return result
