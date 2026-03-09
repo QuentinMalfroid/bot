@@ -152,6 +152,32 @@ async def _sync_trade(trade: dict):
                     "ORDER_MONITOR: SL CANCELLED on Binance for trade #%s %s!",
                     trade_id, symbol,
                 )
+        else:
+            # SL order not found — likely an algo order (STOP_MARKET via algoOrder API)
+            # which can't be queried on testnet. Check position instead.
+            has_filled = any(trade.get(f"{ep}_status") == "filled" for ep in ("ep1", "ep2", "ep3"))
+            if has_filled and use_futures:
+                pos = await binance_client.futures_get_position(symbol)
+                if not pos or float(pos.get("positionAmt", 0)) == 0:
+                    # Position gone = SL was triggered
+                    updates["sl_status"] = "filled"
+                    updates["status"] = "closed"
+                    updates["close_reason"] = "sl_hit"
+                    sl_price = float(trade.get("sl", 0))
+                    total_qty = sum(
+                        float(trade.get(f"{ep}_size_crypto") or 0)
+                        for ep in ("ep1", "ep2", "ep3")
+                        if trade.get(f"{ep}_status") == "filled"
+                    )
+                    pnl = _calculate_pnl(trade, sl_price, total_qty)
+                    if pnl is not None:
+                        updates["realized_pnl"] = round(pnl, 2)
+                        risk_manager.record_trade_result(pnl)
+                    logger.info(
+                        "ORDER_MONITOR: SL HIT (position gone) for trade #%s %s — P&L: %s USDT",
+                        trade_id, symbol,
+                        f"{pnl:.2f}" if pnl is not None else "unknown",
+                    )
 
     # If EPs just filled and no SL order exists yet, place it
     if newly_filled_eps and not trade.get("sl_id"):

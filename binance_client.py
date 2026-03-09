@@ -298,7 +298,12 @@ async def futures_get_position(symbol: str) -> Optional[dict]:
 
 
 async def futures_get_open_orders(symbol: Optional[str] = None) -> list:
-    """Get all open futures orders."""
+    """Get all open futures orders.
+
+    Note: Algo orders (STOP_MARKET placed via algoOrder API) are NOT returned
+    by this endpoint on the testnet. SL detection relies on position monitoring
+    in order_monitor instead.
+    """
     params = {}
     if symbol:
         params["symbol"] = symbol
@@ -341,7 +346,12 @@ async def futures_setup_symbol(symbol: str, leverage: int, margin_type: str = "I
 
 
 async def futures_get_order(symbol: str, order_id: int) -> Optional[dict]:
-    """Get a specific futures order by ID."""
+    """Get a specific futures order by ID.
+
+    For algo orders (STOP_MARKET placed via algoOrder API), the testnet doesn't
+    support reading them back. We return None silently (no error log) so that
+    order_monitor can fall back to position-based SL detection.
+    """
     return await _request("GET", "/fapi/v1/order", {
         "symbol": symbol,
         "orderId": order_id,
