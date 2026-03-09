@@ -295,15 +295,12 @@ async def _execute_candle_sl(trade_id: int):
 async def restore_watches():
     """On startup, restore candle watches for open trades that have candle-based SL.
 
-    Since sl_type is not stored in Supabase, we detect it by checking if the
-    trade's SL matches the "2x 5m" pattern from the Active Futures embeds.
-    Trades with sl_status="watching" are candle-monitored trades.
+    Detects candle SL trades by checking sl_type="candle_2x5m" in Supabase.
+    Only watches trades that have at least one filled entry point.
     """
     trades = await supabase_client.get_open_trades()
     for trade in trades:
-        # Detect candle SL: if sl_status is "watching" (set by _handle_ep_filled)
-        # or if we previously set it up
-        if trade.get("sl_status") == "watching" and trade.get("sl"):
+        if trade.get("sl_type") == "candle_2x5m" and trade.get("sl"):
             has_filled = any(
                 trade.get(f"{ep}_status") == "filled" for ep in ("ep1", "ep2", "ep3")
             )

@@ -303,15 +303,13 @@ async def _handle_ep_filled(trade: dict, symbol: str, trade_id: int, use_futures
         return
 
     # Candle-based SL: monitor 5m candles instead of placing STOP_MARKET
-    # Check in-memory flag set during execute_trade_signal
-    if candle_monitor.is_watched(trade_id):
+    if candle_monitor.is_watched(trade_id) or trade.get("sl_type") == "candle_2x5m":
         candle_monitor.add_watch(
             trade_id=trade_id,
             symbol=symbol,
             side=trade.get("side", "LONG"),
             sl_price=float(sl_price),
         )
-        await supabase_client.update_trade(trade_id, {"sl_status": "watching"})
         logger.info(
             "EXECUTOR: Candle SL monitor started for trade #%s %s @ %s (2x 5m)",
             trade_id, symbol, sl_price,
