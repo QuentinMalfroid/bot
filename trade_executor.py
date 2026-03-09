@@ -449,11 +449,20 @@ async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAle
 
 
 async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures: bool):
-    """Move stop-loss to breakeven (entry price)."""
+    """Move stop-loss to breakeven (entry price). Also cancel unfilled EP orders."""
     cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
 
+    # Cancel existing SL order
     if trade.get("sl_id") and trade.get("sl_status") == "waiting":
         await cancel_fn(symbol, int(trade["sl_id"]))
+
+    # Cancel any unfilled EP limit orders (price moved up, don't want them filling later)
+    for ep in ("ep1", "ep2", "ep3"):
+        if trade.get(f"{ep}_status") == "waiting" and trade.get(f"{ep}_id"):
+            order_id = int(trade[f"{ep}_id"])
+            await cancel_fn(symbol, order_id)
+            await supabase_client.update_trade(trade_id, {f"{ep}_status": "cancelled"})
+            logger.info("EXECUTOR: Cancelled %s order %s (SL→BE) for trade #%s", ep, order_id, trade_id)
 
     be_price = trade.get("ep1")
     if not be_price:

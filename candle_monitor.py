@@ -225,6 +225,13 @@ async def _execute_candle_sl(trade_id: int):
         remove_watch(trade_id)
         return
 
+    # Cancel any remaining limit orders (EP2, EP3 still waiting)
+    for ep in ("ep1", "ep2", "ep3"):
+        if trade.get(f"{ep}_status") == "waiting" and trade.get(f"{ep}_id"):
+            order_id = int(trade[f"{ep}_id"])
+            await binance_client.futures_cancel_order(watch.symbol, order_id)
+            logger.info("CANDLE_MON: Cancelled %s order %s for trade #%s", ep, order_id, trade_id)
+
     # Calculate total filled quantity
     total_qty = 0.0
     for ep in ("ep1", "ep2", "ep3"):
