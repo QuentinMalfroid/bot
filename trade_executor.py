@@ -79,12 +79,31 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         logger.warning("EXECUTOR: Symbol %s not trading (status=%s)", symbol, sym_info.get("status"))
         return
 
-    # ONE TRADE PER SYMBOL: reject if another trade is already open on this symbol+side
+    # ONE TRADE PER SYMBOL: if another trade is already open, track without placing orders
     if await supabase_client.has_open_trade_on_symbol(symbol, trade.direction):
-        logger.warning(
-            "EXECUTOR: SKIPPED %s %s %s - another trade already open on %s %s",
-            symbol, trade.direction, trade.trader, symbol, trade.direction,
-        )
+        # Still insert into Supabase for tracking/analytics (no Binance orders)
+        tracking_row = {
+            "symbol": symbol,
+            "side": trade.direction,
+            "status": "open",
+            "trader": trade.trader,
+            "source_channel": "tracking",
+            "discord_message_id": message_id,
+            "ep1": trade.entry_high,
+            "ep1_status": "waiting",
+            "sl": trade.stop_loss,
+            "sl_status": "waiting" if trade.stop_loss else None,
+        }
+        if trade.entry_low and trade.entry_low != trade.entry_high:
+            tracking_row["ep2"] = trade.entry_low
+            tracking_row["ep2_status"] = "waiting"
+        result = await supabase_client.insert_trade(tracking_row)
+        if result:
+            logger.info(
+                "EXECUTOR: TRACKING %s %s %s (trade #%s) - not executing, another %s %s already open",
+                symbol, trade.direction, trade.trader, result.get("id"),
+                symbol, trade.direction,
+            )
         return
 
     # Setup isolated margin + leverage for futures (WWG rules)
@@ -254,6 +273,14 @@ async def handle_alert(alert: TradeAlert, channel_id: int = 0):
             continue
 
         trade_id = existing["id"]
+
+        # Skip Binance actions for tracking-only trades (no orders placed)
+        if existing.get("source_channel") == "tracking":
+            logger.info(
+                "EXECUTOR: Alert %s for tracking trade #%s %s %s — Supabase updated, no Binance action",
+                alert.event_type, trade_id, symbol, trader,
+            )
+            continue
 
         if alert.event_type == "ep_filled":
             await _handle_ep_filled(existing, symbol, trade_id, use_futures)

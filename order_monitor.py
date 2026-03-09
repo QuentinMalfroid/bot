@@ -62,6 +62,10 @@ async def _sync_trade(trade: dict):
     if not symbol:
         return
 
+    # Skip tracking-only trades (no Binance orders to sync)
+    if trade.get("source_channel") == "tracking":
+        return
+
     # Determine if futures or spot based on source_channel
     use_futures = _is_futures_trade(trade)
     updates = {}
