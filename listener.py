@@ -64,6 +64,10 @@ class TradeListener(discord.Client):
             import candle_monitor
             asyncio.create_task(candle_monitor.restore_watches())
 
+        # Catch up on messages missed during downtime (deploy, restart, crash)
+        logger.info("STARTUP: Catching up on missed messages...")
+        await self._catch_up_missed_messages()
+
     async def _build_role_map(self, guilds: list):
         """Build a mapping of role IDs to trader names from WWG roles."""
         for guild in guilds:
