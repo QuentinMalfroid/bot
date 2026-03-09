@@ -165,6 +165,13 @@ async def _sync_trade(trade: dict):
             trade_id, symbol, list(updates.keys()),
         )
 
+        # If trade just closed, check for promotable tracking trades
+        if updates.get("status") == "closed":
+            import trade_executor
+            await trade_executor._promote_tracking_trade(
+                symbol, trade.get("side", "LONG"), use_futures,
+            )
+
 
 async def _place_sl_for_trade(trade: dict, updates: dict, symbol: str,
                                trade_id: int, use_futures: bool):

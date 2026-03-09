@@ -472,6 +472,9 @@ async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAle
         f"{realized_pnl:.2f}" if realized_pnl is not None else "n/a",
     )
 
+    # Check if a tracking trade on the same symbol can now be promoted
+    await _promote_tracking_trade(symbol, trade.get("side", "LONG"), use_futures)
+
 
 async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures: bool):
     """Move stop-loss to breakeven (entry price). Also cancel unfilled EP orders."""
@@ -690,3 +693,159 @@ async def _handle_tp_hit(trade: dict, symbol: str, trade_id: int,
                         )
     else:
         logger.error("EXECUTOR: Failed to take TP%s for trade #%s %s", tp_level, trade_id, symbol)
+
+
+async def _promote_tracking_trade(symbol: str, side: str, use_futures: bool):
+    """Check if a tracking trade exists on this symbol+side and promote it to active.
+
+    Called when an active trade is closed, freeing the symbol for a new trade.
+    Finds the oldest tracking trade, validates it's still viable, places orders on Binance,
+    and updates Supabase to convert it from tracking to active.
+    """
+    # Find tracking trades on this symbol+side
+    session = await supabase_client._get_session()
+    url = (
+        f"{supabase_client._BASE_URL}/trades"
+        f"?symbol=eq.{symbol}&side=eq.{side}&status=eq.open"
+        f"&source_channel=eq.tracking&order=created_at.asc&limit=1"
+    )
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return
+            rows = await resp.json()
+    except Exception:
+        return
+
+    if not rows:
+        return
+
+    tracking = rows[0]
+    trade_id = tracking["id"]
+    trader = tracking.get("trader", "?")
+
+    logger.info(
+        "EXECUTOR: Found tracking trade #%s %s %s %s — attempting to promote",
+        trade_id, symbol, side, trader,
+    )
+
+    # Check if the entry prices are still reachable
+    if use_futures:
+        current_price = await binance_client.futures_get_price(symbol)
+    else:
+        current_price = await binance_client.get_price(symbol)
+
+    if not current_price:
+        logger.warning("EXECUTOR: Cannot get price for %s, skipping promotion", symbol)
+        return
+
+    ep1_price = tracking.get("ep1")
+    ep2_price = tracking.get("ep2")
+    sl_price = tracking.get("sl")
+
+    if not ep1_price:
+        logger.warning("EXECUTOR: Tracking trade #%s has no EP1, skipping", trade_id)
+        return
+
+    # Check if entry is still viable (price hasn't blown past entries)
+    if side == "LONG":
+        # For LONG: current price should be near or above entries (limit buy below)
+        # If price is way below SL, the trade setup is invalidated
+        if sl_price and current_price < float(sl_price) * 0.98:
+            logger.info(
+                "EXECUTOR: Tracking trade #%s invalidated — price %.2f below SL %.2f",
+                trade_id, current_price, float(sl_price),
+            )
+            await supabase_client.update_trade(trade_id, {"status": "closed", "close_reason": "invalidated"})
+            return
+    else:  # SHORT
+        if sl_price and current_price > float(sl_price) * 1.02:
+            logger.info(
+                "EXECUTOR: Tracking trade #%s invalidated — price %.2f above SL %.2f",
+                trade_id, current_price, float(sl_price),
+            )
+            await supabase_client.update_trade(trade_id, {"status": "closed", "close_reason": "invalidated"})
+            return
+
+    # Setup symbol on Binance
+    if use_futures:
+        await binance_client.futures_setup_symbol(symbol, config.FUTURES_LEVERAGE, config.FUTURES_MARGIN_TYPE)
+
+    # Risk assessment
+    avg_entry = float(ep1_price)
+    if ep2_price:
+        avg_entry = (float(ep1_price) + float(ep2_price)) / 2
+
+    risk = await risk_manager.assess_trade(
+        entry_price=avg_entry,
+        stop_loss=float(sl_price) if sl_price else None,
+        take_profit=None,
+        direction=side,
+        use_futures=use_futures,
+    )
+
+    if not risk.allowed:
+        logger.warning(
+            "EXECUTOR: Tracking trade #%s promotion REJECTED by risk manager: %s",
+            trade_id, risk.reason,
+        )
+        return
+
+    # Place orders
+    order_side = "SELL" if side == "SHORT" else "BUY"
+    total_crypto = risk.position_size_crypto
+
+    if ep2_price:
+        ep1_crypto = total_crypto * 0.5
+        ep2_crypto = total_crypto * 0.5
+    else:
+        ep1_crypto = total_crypto
+        ep2_crypto = 0
+
+    updates = {
+        "source_channel": "promoted",
+        "risk_usdt": risk.risk_capital,
+        "r_multiplier": risk.r_multiplier,
+        "rr_ratio": risk.rr_ratio if risk.rr_ratio > 0 else None,
+    }
+
+    # Place EP1
+    if use_futures:
+        ep1_order = await binance_client.futures_place_limit_order(symbol, order_side, ep1_crypto, float(ep1_price))
+    else:
+        ep1_order = await binance_client.place_limit_order(symbol, order_side, ep1_crypto, float(ep1_price))
+
+    if ep1_order:
+        updates["ep1_id"] = str(ep1_order["orderId"])
+        updates["ep1_status"] = "filled" if ep1_order.get("status") == "FILLED" else "waiting"
+        updates["ep1_size_crypto"] = float(ep1_order.get("origQty", ep1_crypto))
+        updates["ep1_size_usdt"] = float(ep1_order.get("origQty", ep1_crypto)) * float(ep1_price)
+        logger.info(
+            "EXECUTOR: Promoted trade #%s EP1 order placed %s @ %s qty=%s (orderId=%s)",
+            trade_id, symbol, ep1_price, ep1_order.get("origQty"), ep1_order["orderId"],
+        )
+    else:
+        logger.error("EXECUTOR: Failed to place EP1 for promoted trade #%s", trade_id)
+        return
+
+    # Place EP2 if exists
+    if ep2_price and ep2_crypto > 0:
+        if use_futures:
+            ep2_order = await binance_client.futures_place_limit_order(symbol, order_side, ep2_crypto, float(ep2_price))
+        else:
+            ep2_order = await binance_client.place_limit_order(symbol, order_side, ep2_crypto, float(ep2_price))
+        if ep2_order:
+            updates["ep2_id"] = str(ep2_order["orderId"])
+            updates["ep2_status"] = "filled" if ep2_order.get("status") == "FILLED" else "waiting"
+            updates["ep2_size_crypto"] = float(ep2_order.get("origQty", ep2_crypto))
+            updates["ep2_size_usdt"] = float(ep2_order.get("origQty", ep2_crypto)) * float(ep2_price)
+            logger.info(
+                "EXECUTOR: Promoted trade #%s EP2 order placed %s @ %s (orderId=%s)",
+                trade_id, symbol, ep2_price, ep2_order["orderId"],
+            )
+
+    await supabase_client.update_trade(trade_id, updates)
+    logger.info(
+        "EXECUTOR: Trade #%s PROMOTED from tracking to active — %s %s %s risk=%.2f USDT",
+        trade_id, symbol, side, trader, risk.risk_capital,
+    )

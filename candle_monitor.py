@@ -293,6 +293,10 @@ async def _execute_candle_sl(trade_id: int):
             "CANDLE_MON: Trade #%s %s STOPPED OUT via candle SL — closed %s at market, P&L: %.2f",
             trade_id, watch.symbol, close_qty, realized_pnl,
         )
+
+        # Check if a tracking trade on the same symbol can now be promoted
+        import trade_executor
+        await trade_executor._promote_tracking_trade(watch.symbol, watch.side, True)
     else:
         logger.error("CANDLE_MON: Failed to close position for trade #%s %s!", trade_id, watch.symbol)
 
