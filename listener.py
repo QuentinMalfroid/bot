@@ -121,6 +121,11 @@ class TradeListener(discord.Client):
 
     async def _catch_up_missed_messages(self):
         """Fetch recent messages from alert/trade channels to catch up after disconnect."""
+        from datetime import datetime, timezone, timedelta
+
+        # Only catch up messages from the last 5 minutes (covers deploy downtime)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+
         channels_to_check = [
             (config.ALERTS_THREAD_ID, self._process_alerts),
             (config.TRADES_THREAD_ID, None),  # trades handled via _process_trade_signal
@@ -134,9 +139,9 @@ class TradeListener(discord.Client):
                 if channel is None:
                     continue
 
-                # Fetch last 20 messages (covers ~30 min of activity)
+                # Fetch messages from the last 5 minutes only
                 messages = []
-                async for msg in channel.history(limit=20):
+                async for msg in channel.history(limit=20, after=cutoff):
                     messages.append(msg)
 
                 # Process in chronological order (oldest first)
