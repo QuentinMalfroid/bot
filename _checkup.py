@@ -551,6 +551,13 @@ async def main():
                                 )
 
         # ── 9. TP search in embeds + update Supabase ──
+        # Build a map: discord_message_id -> trade (for precise matching)
+        msg_id_to_trade = {}
+        for t in trades:
+            mid = t.get("discord_message_id")
+            if mid:
+                msg_id_to_trade[str(mid)] = t
+
         for msg in discord_data.get("trades", {}).get("all", []):
             if msg["author"]["username"] != "WG Bot":
                 continue
@@ -559,12 +566,9 @@ async def main():
                 tp_match = re.search(r"\*\*TPs?:\*\*\s*(.+)", desc)
                 if not tp_match:
                     continue
-                dir_match = re.search(r":(Long|Short):\s*\*\*(\w+)\*\*", desc)
+                dir_match = re.search(r":(Long|Short):\s*\*\*(?:LIMIT\s*\*\*\s*\*\*)?(\w+)\*\*", desc)
                 if not dir_match:
                     continue
-                direction = dir_match.group(1).upper()
-                asset = dir_match.group(2).upper()
-                symbol = f"{asset}USDT" if not asset.endswith("USDT") else asset
 
                 tp_section = tp_match.group(1)
                 prices, hits = [], []
@@ -581,26 +585,40 @@ async def main():
                 if not prices:
                     continue
 
-                for t in trades:
-                    if t["symbol"] == symbol and t.get("side") == direction:
-                        tp_updates = {}
-                        for i, (price, hit) in enumerate(zip(prices, hits)):
-                            tp_num = i + 1
-                            if tp_num > 6:
-                                break
-                            key = f"tp{tp_num}"
-                            if t.get(key) != price:
-                                tp_updates[key] = price
-                            if hit and t.get(f"{key}_status") != "filled":
-                                tp_updates[f"{key}_status"] = "filled"
-                            elif not hit and not t.get(f"{key}_status"):
-                                tp_updates[f"{key}_status"] = "waiting"
+                # Match by discord_message_id first (precise)
+                matched_trade = msg_id_to_trade.get(msg["id"])
 
-                        if tp_updates:
-                            await supa_patch(t["id"], tp_updates)
-                            corrections.append(
-                                f"Trade #{t['id']} {symbol} TPs updated: {tp_updates}"
-                            )
+                if not matched_trade:
+                    # Fallback: check if this embed is an edit/update of an
+                    # existing trade message (same message_id as a trade)
+                    # Also check referenced messages
+                    ref = msg.get("message_reference", {})
+                    ref_id = ref.get("message_id")
+                    if ref_id:
+                        matched_trade = msg_id_to_trade.get(str(ref_id))
+
+                if not matched_trade:
+                    continue
+
+                t = matched_trade
+                tp_updates = {}
+                for i, (price, hit) in enumerate(zip(prices, hits)):
+                    tp_num = i + 1
+                    if tp_num > 6:
+                        break
+                    key = f"tp{tp_num}"
+                    if t.get(key) != price:
+                        tp_updates[key] = price
+                    if hit and t.get(f"{key}_status") != "filled":
+                        tp_updates[f"{key}_status"] = "filled"
+                    elif not hit and not t.get(f"{key}_status"):
+                        tp_updates[f"{key}_status"] = "waiting"
+
+                if tp_updates:
+                    await supa_patch(t["id"], tp_updates)
+                    corrections.append(
+                        f"Trade #{t['id']} {t['symbol']} TPs updated: {tp_updates}"
+                    )
 
         # ── 9b. Place TP orders on Binance for trades with TPs but no orders ──
         # Re-fetch trades to get updated TP values
