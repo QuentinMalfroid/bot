@@ -89,13 +89,14 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
             "trader": trade.trader,
             "source_channel": "tracking",
             "discord_message_id": message_id,
-            "ep1": trade.entry_high,
+            # SHORT: price rises → hits entry_low first; LONG: price drops → hits entry_high first
+            "ep1": trade.entry_low if trade.direction == "SHORT" else trade.entry_high,
             "ep1_status": "waiting",
             "sl": trade.stop_loss,
             "sl_status": "waiting" if trade.stop_loss else None,
         }
         if trade.entry_low and trade.entry_low != trade.entry_high:
-            tracking_row["ep2"] = trade.entry_low
+            tracking_row["ep2"] = trade.entry_high if trade.direction == "SHORT" else trade.entry_low
             tracking_row["ep2_status"] = "waiting"
         result = await supabase_client.insert_trade(tracking_row)
         if result:
@@ -123,8 +124,13 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         return
 
     # Determine entry prices
-    ep1_price = trade.entry_high
-    ep2_price = trade.entry_low if trade.entry_low and trade.entry_low != trade.entry_high else None
+    # SHORT: price rises → hits entry_low first; LONG: price drops → hits entry_high first
+    if trade.direction == "SHORT":
+        ep1_price = trade.entry_low
+        ep2_price = trade.entry_high if trade.entry_low and trade.entry_low != trade.entry_high else None
+    else:
+        ep1_price = trade.entry_high
+        ep2_price = trade.entry_low if trade.entry_low and trade.entry_low != trade.entry_high else None
 
     if ep1_price is None:
         logger.error("EXECUTOR: No entry price for %s", symbol)

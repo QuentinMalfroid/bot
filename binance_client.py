@@ -243,6 +243,7 @@ async def futures_place_stop_loss_order(
         "triggerPrice": f"{sp}",
         "quantity": f"{qty}",
         "closePosition": "false",
+        "reduceOnly": "true",
         "workingType": "CONTRACT_PRICE",
     }
     result = await _request("POST", "/fapi/v1/algoOrder", params, base_url=FUTURES_BASE)
