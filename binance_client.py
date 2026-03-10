@@ -260,6 +260,52 @@ async def futures_place_stop_loss_order(
     return result
 
 
+async def futures_place_tp_order(
+    symbol: str,
+    side: str,
+    quantity: float,
+    price: float,
+) -> Optional[dict]:
+    """Place a futures LIMIT order as Take Profit (reduceOnly).
+
+    Args:
+        symbol: e.g. "BTCUSDT"
+        side: "BUY" for SHORT TPs, "SELL" for LONG TPs
+        quantity: amount to close at this TP level
+        price: TP price level
+    """
+    symbol_info = await futures_get_symbol_info(symbol)
+    if not symbol_info:
+        return None
+
+    lot = _get_lot_size(symbol_info)
+    pf = _get_price_filter(symbol_info)
+
+    qty = _round_step(quantity, lot["step_size"])
+    p = _round_price(price, pf["tick_size"])
+
+    if qty <= 0:
+        logger.warning("BINANCE FUTURES: TP qty too small after rounding: %s", quantity)
+        return None
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "LIMIT",
+        "quantity": f"{qty}",
+        "price": f"{p}",
+        "timeInForce": "GTC",
+        "reduceOnly": "true",
+    }
+    result = await _request("POST", "/fapi/v1/order", params, base_url=FUTURES_BASE)
+    if result:
+        logger.info(
+            "BINANCE FUTURES: TP %s %s qty=%s price=%s -> orderId=%s",
+            side, symbol, qty, p, result.get("orderId"),
+        )
+    return result
+
+
 async def futures_cancel_algo_order(algo_id: int) -> Optional[dict]:
     """Cancel a futures algo/conditional order."""
     result = await _request("DELETE", "/fapi/v1/algoOrder", {

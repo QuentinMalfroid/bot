@@ -448,28 +448,57 @@ async def main():
                 continue
 
             # Check if SL order exists on Binance
+            # SL orders are algo/conditional orders — must query via /fapi/v1/algoOrder
             sl_exists = False
             if t.get("sl_id"):
                 try:
                     if use_futures:
-                        sl_order = await binance_client.futures_get_order(symbol, int(t["sl_id"]))
+                        # Query algo order status directly
+                        import hmac, hashlib, time as _time
+                        _ts = str(int(_time.time() * 1000))
+                        _ak = os.getenv("BINANCE_API_KEY")
+                        _as = os.getenv("BINANCE_SECRET_KEY")
+                        _params = f'algoId={t["sl_id"]}&timestamp={_ts}&recvWindow=5000'
+                        _sig = hmac.new(_as.encode(), _params.encode(), hashlib.sha256).hexdigest()
+                        _url = f'https://testnet.binancefuture.com/fapi/v1/algoOrder?{_params}&signature={_sig}'
+                        async with s.get(_url, headers={"X-MBX-APIKEY": _ak}) as _r:
+                            if _r.status == 200:
+                                _algo = await _r.json()
+                                _algo_status = _algo.get("algoStatus", "")
+                                if _algo_status == "NEW":
+                                    sl_exists = True
+                                    print(f"  OK #{t['id']} {symbol} SL algoId={t['sl_id']} is active (algoStatus=NEW)")
+                                elif _algo_status == "TRIGGERED":
+                                    # SL was triggered — close the trade
+                                    await supa_patch(t["id"], {
+                                        "status": "closed",
+                                        "close_reason": "stopped_out",
+                                        "sl_status": "filled",
+                                    })
+                                    corrections.append(
+                                        f"Trade #{t['id']} {symbol} SL triggered -> closed (stopped_out)"
+                                    )
+                                    continue
+                                elif _algo_status in ("CANCELLED", "EXPIRED"):
+                                    print(f"  WARN #{t['id']} {symbol} SL algoId={t['sl_id']} is {_algo_status}")
+                                else:
+                                    print(f"  #{t['id']} {symbol} SL algoId={t['sl_id']} status={_algo_status}")
                     else:
                         sl_order = await binance_client.get_order(symbol, int(t["sl_id"]))
-                    if sl_order and sl_order.get("status") in ("NEW", "PARTIALLY_FILLED"):
-                        sl_exists = True
-                    elif sl_order and sl_order.get("status") == "FILLED":
-                        # SL was triggered — close the trade
-                        await supa_patch(t["id"], {
-                            "status": "closed",
-                            "close_reason": "stopped_out",
-                            "sl_status": "filled",
-                        })
-                        corrections.append(
-                            f"Trade #{t['id']} {symbol} SL triggered -> closed (stopped_out)"
-                        )
-                        continue
-                except Exception:
-                    pass
+                        if sl_order and sl_order.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                            sl_exists = True
+                        elif sl_order and sl_order.get("status") == "FILLED":
+                            await supa_patch(t["id"], {
+                                "status": "closed",
+                                "close_reason": "stopped_out",
+                                "sl_status": "filled",
+                            })
+                            corrections.append(
+                                f"Trade #{t['id']} {symbol} SL triggered -> closed (stopped_out)"
+                            )
+                            continue
+                except Exception as e:
+                    print(f"  WARN #{t['id']} {symbol} SL check error: {e}")
 
             if not sl_exists:
                 # Check if there's actually a position
@@ -572,6 +601,60 @@ async def main():
                             corrections.append(
                                 f"Trade #{t['id']} {symbol} TPs updated: {tp_updates}"
                             )
+
+        # ── 9b. Place TP orders on Binance for trades with TPs but no orders ──
+        # Re-fetch trades to get updated TP values
+        async with s.get(
+            f"{SUPA_URL}/rest/v1/trades?status=eq.open&order=created_at.desc",
+            headers=supa_h,
+        ) as r:
+            trades = await r.json()
+
+        for t in trades:
+            use_futures = "spot" not in (t.get("source_channel") or "").lower()
+            if not use_futures:
+                continue
+
+            # Check if trade has filled position
+            total_qty = 0.0
+            for ep in ("ep1", "ep2", "ep3"):
+                if t.get(f"{ep}_status") == "filled":
+                    qty = t.get(f"{ep}_size_crypto")
+                    if qty:
+                        total_qty += float(qty)
+            if total_qty <= 0:
+                continue
+
+            # Collect TPs that need orders
+            tp_prices = []
+            for i in range(1, 7):
+                tp = t.get(f"tp{i}")
+                tp_id = t.get(f"tp{i}_id")
+                tp_status = t.get(f"tp{i}_status")
+                if tp and not tp_id and tp_status == "waiting":
+                    tp_prices.append((i, float(tp)))
+
+            if not tp_prices:
+                continue
+
+            tp_side = "SELL" if t.get("side") == "LONG" else "BUY"
+            num_tps = len(tp_prices)
+
+            for idx, (tp_num, tp_price) in enumerate(tp_prices):
+                if idx < num_tps - 1:
+                    tp_qty = round(total_qty / num_tps, 8)
+                else:
+                    tp_qty = round(total_qty - round(total_qty / num_tps, 8) * (num_tps - 1), 8)
+
+                tp_order = await binance_client.futures_place_tp_order(
+                    t["symbol"], tp_side, tp_qty, tp_price,
+                )
+                if tp_order:
+                    order_id = tp_order.get("orderId")
+                    await supa_patch(t["id"], {f"tp{tp_num}_id": str(order_id)})
+                    corrections.append(
+                        f"Trade #{t['id']} {t['symbol']} TP{tp_num} placed @ {tp_price} qty={tp_qty} (orderId={order_id})"
+                    )
 
         # ── 10. Risk summary ──
         bal = await binance_client.futures_get_balance("USDT")

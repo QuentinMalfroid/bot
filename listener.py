@@ -494,9 +494,67 @@ class TradeListener(discord.Client):
                     trade_id, symbol,
                     [f"TP{i+1}={p}" for i, p in enumerate(analysis.take_profits[:6])],
                 )
+                # Place TP limit orders on Binance
+                await self._place_tp_orders(trade, symbol, direction, analysis.take_profits[:6], tp_updates)
 
         except Exception as e:
             logger.error("CHART: Error extracting TPs from chart for message %s: %s", message.id, e)
+
+    async def _place_tp_orders(self, trade: dict, symbol: str, direction: str,
+                                tp_prices: list, tp_updates: dict):
+        """Place TP limit orders on Binance for a trade with known TPs."""
+        try:
+            use_futures = "spot" not in (trade.get("source_channel") or "").lower()
+            if not use_futures:
+                return  # Spot TP placement not implemented yet
+
+            # Calculate total filled qty
+            total_qty = 0.0
+            for ep in ("ep1", "ep2", "ep3"):
+                if trade.get(f"{ep}_status") == "filled":
+                    qty = trade.get(f"{ep}_size_crypto")
+                    if qty:
+                        total_qty += float(qty)
+
+            if total_qty <= 0:
+                logger.debug("TP_ORDERS: No filled position for trade #%s, skipping TP placement", trade["id"])
+                return
+
+            # TP side: SELL for LONG, BUY for SHORT
+            tp_side = "SELL" if direction == "LONG" else "BUY"
+            num_tps = len(tp_prices)
+            order_updates = {}
+
+            for i, tp_price in enumerate(tp_prices):
+                tp_num = i + 1
+                # Skip if TP order already exists
+                if trade.get(f"tp{tp_num}_id"):
+                    continue
+
+                # Split qty: equal parts, last TP gets the remainder
+                if i < num_tps - 1:
+                    tp_qty = round(total_qty / num_tps, 8)
+                else:
+                    tp_qty = round(total_qty - tp_qty * (num_tps - 1), 8)
+
+                tp_order = await binance_client.futures_place_tp_order(
+                    symbol, tp_side, tp_qty, float(tp_price),
+                )
+                if tp_order:
+                    order_id = tp_order.get("orderId")
+                    order_updates[f"tp{tp_num}_id"] = str(order_id)
+                    logger.info(
+                        "TP_ORDERS: Placed TP%s for trade #%s %s @ %s qty=%s (orderId=%s)",
+                        tp_num, trade["id"], symbol, tp_price, tp_qty, order_id,
+                    )
+                else:
+                    logger.error("TP_ORDERS: Failed to place TP%s for trade #%s %s @ %s", tp_num, trade["id"], symbol, tp_price)
+
+            if order_updates:
+                await supabase_client.update_trade(trade["id"], order_updates)
+
+        except Exception as e:
+            logger.error("TP_ORDERS: Error placing TP orders for trade #%s: %s", trade["id"], e)
 
     async def _fetch_and_update_tps(self, channel_id: str, message_id: str,
                                      trade_id: int, existing: dict):
