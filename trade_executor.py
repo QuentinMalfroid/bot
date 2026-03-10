@@ -264,6 +264,28 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
             risk.rr_ratio,
         )
 
+        # Place SL if any EP was immediately filled
+        any_filled = row.get("ep1_status") == "filled" or row.get("ep2_status") == "filled"
+        if any_filled and trade.stop_loss and trade.sl_type != "candle_2x5m":
+            total_qty = 0.0
+            for ep_key in ("ep1", "ep2"):
+                if row.get(f"{ep_key}_status") == "filled":
+                    qty = row.get(f"{ep_key}_size_crypto")
+                    if qty:
+                        total_qty += float(qty)
+            if total_qty > 0:
+                sl_side = "SELL" if trade.direction == "LONG" else "BUY"
+                if use_futures:
+                    sl_order = await binance_client.futures_place_stop_loss_order(symbol, sl_side, total_qty, trade.stop_loss)
+                else:
+                    sl_order = await binance_client.place_stop_loss_order(symbol, sl_side, total_qty, trade.stop_loss)
+                if sl_order:
+                    sl_id = sl_order.get("algoId") or sl_order.get("orderId")
+                    await supabase_client.update_trade(trade_id, {"sl_id": str(sl_id), "sl_status": "waiting"})
+                    logger.info("EXECUTOR: SL placed for trade #%s %s @ %s qty=%s (id=%s)", trade_id, symbol, trade.stop_loss, total_qty, sl_id)
+                else:
+                    logger.error("EXECUTOR: FAILED to place SL for trade #%s %s @ %s!", trade_id, symbol, trade.stop_loss)
+
         # Start candle monitor for 2x5m SL instead of placing STOP_MARKET
         if trade.sl_type == "candle_2x5m" and trade_id and trade.stop_loss:
             candle_monitor.add_watch(
@@ -892,6 +914,29 @@ async def _promote_tracking_trade(symbol: str, side: str, use_futures: bool):
                 trade_id, symbol, ep2_price, ep2_order["orderId"],
             )
 
+    # Place SL if any EP was immediately filled
+    any_filled = updates.get("ep1_status") == "filled" or updates.get("ep2_status") == "filled"
+    if any_filled and sl_price and "sl_id" not in updates:
+        total_qty = 0.0
+        for ep_key in ("ep1", "ep2"):
+            if updates.get(f"{ep_key}_status") == "filled":
+                qty = updates.get(f"{ep_key}_size_crypto")
+                if qty:
+                    total_qty += float(qty)
+        if total_qty > 0:
+            sl_side = "SELL" if side == "LONG" else "BUY"
+            if use_futures:
+                sl_order = await binance_client.futures_place_stop_loss_order(symbol, sl_side, total_qty, float(sl_price))
+            else:
+                sl_order = await binance_client.place_stop_loss_order(symbol, sl_side, total_qty, float(sl_price))
+            if sl_order:
+                sl_id = sl_order.get("algoId") or sl_order.get("orderId")
+                updates["sl_id"] = str(sl_id)
+                updates["sl_status"] = "waiting"
+                logger.info("EXECUTOR: SL placed for promoted trade #%s %s @ %s qty=%s (id=%s)", trade_id, symbol, sl_price, total_qty, sl_id)
+            else:
+                logger.error("EXECUTOR: FAILED to place SL for promoted trade #%s %s @ %s!", trade_id, symbol, sl_price)
+
     await supabase_client.update_trade(trade_id, updates)
     logger.info(
         "EXECUTOR: Trade #%s PROMOTED from tracking to active — %s %s %s risk=%.2f USDT",
@@ -999,6 +1044,29 @@ async def _promote_tracking_on_fill(trade: dict, symbol: str, trade_id: int,
             updates["ep2_status"] = "filled" if ep2_order.get("status") == "FILLED" else "waiting"
             updates["ep2_size_crypto"] = float(ep2_order.get("origQty", ep2_crypto))
             updates["ep2_size_usdt"] = float(ep2_order.get("origQty", ep2_crypto)) * float(ep2_price)
+
+    # Place SL if any EP was immediately filled
+    any_filled = updates.get("ep1_status") == "filled" or updates.get("ep2_status") == "filled"
+    if any_filled and sl_price and "sl_id" not in updates:
+        total_qty = 0.0
+        for ep_key in ("ep1", "ep2"):
+            if updates.get(f"{ep_key}_status") == "filled":
+                qty = updates.get(f"{ep_key}_size_crypto")
+                if qty:
+                    total_qty += float(qty)
+        if total_qty > 0:
+            sl_side = "SELL" if side == "LONG" else "BUY"
+            if use_futures:
+                sl_order = await binance_client.futures_place_stop_loss_order(symbol, sl_side, total_qty, float(sl_price))
+            else:
+                sl_order = await binance_client.place_stop_loss_order(symbol, sl_side, total_qty, float(sl_price))
+            if sl_order:
+                sl_id = sl_order.get("algoId") or sl_order.get("orderId")
+                updates["sl_id"] = str(sl_id)
+                updates["sl_status"] = "waiting"
+                logger.info("EXECUTOR: SL placed for promoted trade #%s %s @ %s qty=%s (id=%s)", trade_id, symbol, sl_price, total_qty, sl_id)
+            else:
+                logger.error("EXECUTOR: FAILED to place SL for promoted trade #%s %s @ %s!", trade_id, symbol, sl_price)
 
     await supabase_client.update_trade(trade_id, updates)
     logger.info(
@@ -1309,6 +1377,29 @@ async def _promote_single_trade(trade: dict, symbol: str, side: str,
             updates["ep2_status"] = "filled" if ep2_order.get("status") == "FILLED" else "waiting"
             updates["ep2_size_crypto"] = float(ep2_order.get("origQty", ep2_crypto))
             updates["ep2_size_usdt"] = float(ep2_order.get("origQty", ep2_crypto)) * float(ep2_price)
+
+    # Place SL if any EP was immediately filled
+    any_filled = updates.get("ep1_status") == "filled" or updates.get("ep2_status") == "filled"
+    if any_filled and sl_price and "sl_id" not in updates:
+        total_qty = 0.0
+        for ep_key in ("ep1", "ep2"):
+            if updates.get(f"{ep_key}_status") == "filled":
+                qty = updates.get(f"{ep_key}_size_crypto")
+                if qty:
+                    total_qty += float(qty)
+        if total_qty > 0:
+            sl_side = "SELL" if side == "LONG" else "BUY"
+            if use_futures:
+                sl_order = await binance_client.futures_place_stop_loss_order(symbol, sl_side, total_qty, float(sl_price))
+            else:
+                sl_order = await binance_client.place_stop_loss_order(symbol, sl_side, total_qty, float(sl_price))
+            if sl_order:
+                sl_id = sl_order.get("algoId") or sl_order.get("orderId")
+                updates["sl_id"] = str(sl_id)
+                updates["sl_status"] = "waiting"
+                logger.info("REBALANCE: SL placed for promoted trade #%s %s @ %s qty=%s (id=%s)", trade_id, symbol, sl_price, total_qty, sl_id)
+            else:
+                logger.error("REBALANCE: FAILED to place SL for promoted trade #%s %s @ %s!", trade_id, symbol, sl_price)
 
     await supabase_client.update_trade(trade_id, updates)
     logger.info(

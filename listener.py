@@ -7,6 +7,7 @@ import aiohttp
 import discord
 
 import binance_client
+import chart_analyzer
 import config
 import database
 import order_monitor
@@ -187,6 +188,20 @@ class TradeListener(discord.Client):
         # When WG Bot edits a trades message, check for TP updates in embeds
         if channel_id == config.TRADES_THREAD_ID and after.embeds:
             await self._process_tp_update_from_edit(after)
+
+            # Check if an image was added (chart with TPs)
+            before_images = set()
+            for e in (before.embeds or []):
+                img = e.to_dict().get("image", {}).get("url")
+                if img:
+                    before_images.add(img)
+
+            for embed in after.embeds:
+                embed_dict = embed.to_dict()
+                img_url = embed_dict.get("image", {}).get("url")
+                if img_url and img_url not in before_images:
+                    logger.info("CHART: New image detected in message %s", after.id)
+                    await self._extract_tps_from_chart(after, embed_dict, img_url)
 
         await self._process_message(after)
 
@@ -416,6 +431,72 @@ class TradeListener(discord.Client):
                         "TP_UPDATE: Trade #%s %s updated from edit: %s",
                         trade_id, symbol, tp_updates,
                     )
+
+    async def _extract_tps_from_chart(self, message: discord.Message,
+                                      embed_dict: dict, image_url: str):
+        """Download chart image, analyze with GPT-4o Vision, extract TPs, update Supabase."""
+        try:
+            # Extract direction and asset from the embed description
+            desc = embed_dict.get("description", "")
+            match = re.search(r":(Long|Short):\s*\**(?:LIMIT\s*\**)?\s*\**(\w+)\**", desc)
+            if not match:
+                logger.debug("CHART: No direction/asset in embed, skipping")
+                return
+
+            direction = match.group(1).upper()
+            asset = match.group(2).upper()
+            symbol = f"{asset}USDT" if not asset.endswith("USDT") else asset
+
+            # Find the matching open trade
+            trades = await supabase_client.get_open_trades(symbol)
+            matching = [t for t in trades if t.get("side") == direction]
+            if not matching:
+                logger.debug("CHART: No open %s %s trade found", symbol, direction)
+                return
+
+            # Prefer the trade with discord_message_id matching, or most recent
+            trade = None
+            for t in matching:
+                if t.get("discord_message_id") == str(message.id):
+                    trade = t
+                    break
+            if not trade:
+                # Check if the original Wealth Group message just after this one matches
+                # Fall back to the most recent matching trade
+                trade = max(matching, key=lambda t: t["id"])
+
+            trade_id = trade["id"]
+
+            # Skip if TPs are already filled in
+            has_tps = any(trade.get(f"tp{i}") for i in range(1, 7))
+            if has_tps:
+                logger.debug("CHART: Trade #%s already has TPs, skipping", trade_id)
+                return
+
+            # Analyze the chart image
+            logger.info("CHART: Analyzing image for trade #%s %s %s", trade_id, symbol, direction)
+            analysis = await chart_analyzer.analyze_chart_image(image_url=image_url)
+            if not analysis or not analysis.take_profits:
+                logger.warning("CHART: No TPs extracted for trade #%s", trade_id)
+                return
+
+            # Update Supabase with extracted TPs
+            tp_updates = {}
+            for i, tp_price in enumerate(analysis.take_profits[:6]):
+                tp_num = i + 1
+                tp_updates[f"tp{tp_num}"] = float(tp_price)
+                tp_updates[f"tp{tp_num}_status"] = "waiting"
+
+            if tp_updates:
+                await supabase_client.update_trade(trade_id, tp_updates)
+                logger.info(
+                    "CHART: Trade #%s %s TPs extracted from chart: %s",
+                    trade_id, symbol,
+                    [f"TP{i+1}={p}" for i, p in enumerate(analysis.take_profits[:6])],
+                )
+
+        except Exception as e:
+            logger.error("CHART: Error extracting TPs from chart for message %s: %s", message.id, e)
 
     async def _fetch_and_update_tps(self, channel_id: str, message_id: str,
                                      trade_id: int, existing: dict):

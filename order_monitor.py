@@ -232,11 +232,17 @@ async def _place_sl_for_trade(trade: dict, updates: dict, symbol: str,
         )
 
     if sl_order:
-        updates["sl_id"] = str(sl_order["orderId"])
+        sl_id = sl_order.get("algoId") or sl_order.get("orderId")
+        updates["sl_id"] = str(sl_id)
         updates["sl_status"] = "waiting"
         logger.info(
-            "ORDER_MONITOR: SL placed for trade #%s %s @ %s qty=%s (orderId=%s)",
-            trade_id, symbol, sl_price, total_qty, sl_order["orderId"],
+            "ORDER_MONITOR: SL placed for trade #%s %s @ %s qty=%s (id=%s)",
+            trade_id, symbol, sl_price, total_qty, sl_id,
+        )
+    else:
+        logger.error(
+            "ORDER_MONITOR: FAILED to place SL for trade #%s %s @ %s qty=%s!",
+            trade_id, symbol, sl_price, total_qty,
         )
 
 
