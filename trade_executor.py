@@ -146,9 +146,32 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
 
     if not risk.allowed:
         logger.warning(
-            "EXECUTOR: Trade REJECTED by risk manager - %s %s: %s",
+            "EXECUTOR: Trade REJECTED by risk manager - %s %s: %s (saving as tracking)",
             symbol, trade.direction, risk.reason,
         )
+        # Save as tracking so it can be promoted later when risk allows
+        tracking_row = {
+            "symbol": symbol,
+            "side": trade.direction,
+            "status": "open",
+            "trader": trade.trader,
+            "source_channel": "tracking",
+            "discord_message_id": message_id,
+            "ep1": ep1_price,
+            "ep1_status": "waiting",
+            "sl": trade.stop_loss,
+            "sl_status": "waiting" if trade.stop_loss else None,
+        }
+        if ep2_price:
+            tracking_row["ep2"] = ep2_price
+            tracking_row["ep2_status"] = "waiting"
+        result = await supabase_client.insert_trade(tracking_row)
+        if result:
+            logger.info(
+                "EXECUTOR: TRACKING %s %s %s (trade #%s) - risk rejected: %s",
+                symbol, trade.direction, trade.trader, result.get("id"),
+                risk.reason,
+            )
         return
 
     # Split position between entries
@@ -274,13 +297,32 @@ async def handle_alert(alert: TradeAlert, channel_id: int = 0):
 
         trade_id = existing["id"]
 
-        # Skip Binance actions for tracking-only trades (no orders placed)
+        # For tracking trades: only handle ep_filled (promotion) and close events
         if existing.get("source_channel") == "tracking":
-            logger.info(
-                "EXECUTOR: Alert %s for tracking trade #%s %s %s — Supabase updated, no Binance action",
-                alert.event_type, trade_id, symbol, trader,
-            )
-            continue
+            if alert.event_type == "ep_filled":
+                logger.info(
+                    "EXECUTOR: ep_filled alert for TRACKING trade #%s %s %s — attempting promotion",
+                    trade_id, symbol, trader,
+                )
+                await _promote_tracking_on_fill(existing, symbol, trade_id, side, use_futures)
+                continue
+            elif alert.new_status in ("closed", "cancelled"):
+                # Just close in Supabase, no Binance action needed
+                updates = {"status": alert.new_status or "closed"}
+                if alert.close_reason:
+                    updates["close_reason"] = alert.close_reason
+                await supabase_client.update_trade(trade_id, updates)
+                logger.info(
+                    "EXECUTOR: Tracking trade #%s closed — %s/%s",
+                    trade_id, alert.new_status, alert.close_reason,
+                )
+                continue
+            else:
+                logger.info(
+                    "EXECUTOR: Alert %s for tracking trade #%s %s %s — no Binance action",
+                    alert.event_type, trade_id, symbol, trader,
+                )
+                continue
 
         if alert.event_type == "ep_filled":
             await _handle_ep_filled(existing, symbol, trade_id, use_futures)
@@ -849,3 +891,422 @@ async def _promote_tracking_trade(symbol: str, side: str, use_futures: bool):
         "EXECUTOR: Trade #%s PROMOTED from tracking to active — %s %s %s risk=%.2f USDT",
         trade_id, symbol, side, trader, risk.risk_capital,
     )
+
+
+async def _promote_tracking_on_fill(trade: dict, symbol: str, trade_id: int,
+                                      side: str, use_futures: bool):
+    """Promote a tracking trade when its 'limit order filled' alert arrives.
+
+    If risk budget is exceeded, first demote the furthest unfilled active trade
+    to make room, then promote this one.
+    """
+    ep1_price = trade.get("ep1")
+    sl_price = trade.get("sl")
+    if not ep1_price or not sl_price:
+        logger.warning("EXECUTOR: Cannot promote #%s — missing EP1 or SL", trade_id)
+        return
+
+    # Check if risk allows promotion; if not, try to free up by demoting furthest trade
+    avg_entry = float(ep1_price)
+    ep2_price = trade.get("ep2")
+    if ep2_price:
+        avg_entry = (float(ep1_price) + float(ep2_price)) / 2
+
+    risk = await risk_manager.assess_trade(
+        entry_price=avg_entry,
+        stop_loss=float(sl_price),
+        take_profit=None,
+        direction=side,
+        use_futures=use_futures,
+    )
+
+    if not risk.allowed:
+        logger.info(
+            "EXECUTOR: Promotion of #%s blocked by risk (%s) — trying to demote furthest trade",
+            trade_id, risk.reason,
+        )
+        demoted = await _demote_furthest_trade(symbol, side, trade_id, use_futures)
+        if not demoted:
+            logger.warning(
+                "EXECUTOR: Cannot promote #%s — no trade to demote and risk exceeded",
+                trade_id,
+            )
+            return
+        # Re-check risk after demotion
+        risk = await risk_manager.assess_trade(
+            entry_price=avg_entry,
+            stop_loss=float(sl_price),
+            take_profit=None,
+            direction=side,
+            use_futures=use_futures,
+        )
+        if not risk.allowed:
+            logger.warning(
+                "EXECUTOR: Still cannot promote #%s after demotion — %s",
+                trade_id, risk.reason,
+            )
+            return
+
+    # Setup symbol
+    if use_futures:
+        await binance_client.futures_setup_symbol(symbol, config.FUTURES_LEVERAGE, config.FUTURES_MARGIN_TYPE)
+
+    # Place orders
+    order_side = "SELL" if side == "SHORT" else "BUY"
+    total_crypto = risk.position_size_crypto
+
+    if ep2_price:
+        ep1_crypto = total_crypto * 0.5
+        ep2_crypto = total_crypto * 0.5
+    else:
+        ep1_crypto = total_crypto
+        ep2_crypto = 0
+
+    updates = {
+        "source_channel": "promoted",
+        "risk_usdt": risk.risk_capital,
+        "r_multiplier": risk.r_multiplier,
+        "rr_ratio": risk.rr_ratio if risk.rr_ratio > 0 else None,
+    }
+
+    if use_futures:
+        ep1_order = await binance_client.futures_place_limit_order(symbol, order_side, ep1_crypto, float(ep1_price))
+    else:
+        ep1_order = await binance_client.place_limit_order(symbol, order_side, ep1_crypto, float(ep1_price))
+
+    if ep1_order:
+        updates["ep1_id"] = str(ep1_order["orderId"])
+        updates["ep1_status"] = "filled" if ep1_order.get("status") == "FILLED" else "waiting"
+        updates["ep1_size_crypto"] = float(ep1_order.get("origQty", ep1_crypto))
+        updates["ep1_size_usdt"] = float(ep1_order.get("origQty", ep1_crypto)) * float(ep1_price)
+    else:
+        logger.error("EXECUTOR: Failed EP1 for promotion of #%s", trade_id)
+        return
+
+    if ep2_price and ep2_crypto > 0:
+        if use_futures:
+            ep2_order = await binance_client.futures_place_limit_order(symbol, order_side, ep2_crypto, float(ep2_price))
+        else:
+            ep2_order = await binance_client.place_limit_order(symbol, order_side, ep2_crypto, float(ep2_price))
+        if ep2_order:
+            updates["ep2_id"] = str(ep2_order["orderId"])
+            updates["ep2_status"] = "filled" if ep2_order.get("status") == "FILLED" else "waiting"
+            updates["ep2_size_crypto"] = float(ep2_order.get("origQty", ep2_crypto))
+            updates["ep2_size_usdt"] = float(ep2_order.get("origQty", ep2_crypto)) * float(ep2_price)
+
+    await supabase_client.update_trade(trade_id, updates)
+    logger.info(
+        "EXECUTOR: Trade #%s PROMOTED on fill alert — %s %s %s risk=%.2f USDT",
+        trade_id, symbol, side, trade.get("trader", "?"), risk.risk_capital,
+    )
+
+
+async def _demote_furthest_trade(exclude_symbol: str, exclude_side: str,
+                                   exclude_id: int, use_futures: bool) -> bool:
+    """Demote the active trade whose entry is furthest from current price.
+
+    Cancels its Binance orders and sets source_channel=tracking.
+    Skips the trade being promoted (exclude_id) and filled positions.
+    Returns True if a trade was successfully demoted.
+    """
+    trades = await supabase_client.get_open_trades()
+    # Filter to active (non-tracking) trades with unfilled EPs only
+    candidates = []
+    for t in trades:
+        if t["id"] == exclude_id:
+            continue
+        if t.get("source_channel") == "tracking":
+            continue
+        # Skip trades that have filled positions (we don't want to close positions)
+        has_filled = any(
+            t.get(f"ep{i}_status") == "filled" for i in range(1, 4)
+        )
+        if has_filled:
+            continue
+        # Must have entry price
+        if not t.get("ep1"):
+            continue
+        candidates.append(t)
+
+    if not candidates:
+        logger.info("EXECUTOR: No candidate trades to demote")
+        return False
+
+    # Get current prices and find furthest
+    furthest = None
+    max_distance = 0
+
+    for t in candidates:
+        symbol = t["symbol"]
+        ep1 = float(t["ep1"])
+        if use_futures:
+            price = await binance_client.futures_get_price(symbol)
+        else:
+            price = await binance_client.get_price(symbol)
+        if not price:
+            continue
+        distance_pct = abs(price - ep1) / price * 100
+        if distance_pct > max_distance:
+            max_distance = distance_pct
+            furthest = t
+
+    if not furthest:
+        return False
+
+    fid = furthest["id"]
+    fsym = furthest["symbol"]
+    logger.info(
+        "EXECUTOR: Demoting trade #%s %s %s (%.1f%% from price) to make room",
+        fid, fsym, furthest.get("trader", "?"), max_distance,
+    )
+
+    # Cancel Binance orders
+    cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
+    for ep in ("ep1", "ep2", "ep3"):
+        oid = furthest.get(f"{ep}_id")
+        if oid and furthest.get(f"{ep}_status") == "waiting":
+            await cancel_fn(fsym, int(oid))
+            logger.info("EXECUTOR: Cancelled %s order %s for demoted #%s", ep, oid, fid)
+
+    # Update Supabase
+    await supabase_client.update_trade(fid, {
+        "source_channel": "tracking",
+        "risk_usdt": None,
+        "r_multiplier": None,
+        "rr_ratio": None,
+        "ep1_id": None,
+        "ep2_id": None,
+        "ep3_id": None,
+    })
+
+    logger.info("EXECUTOR: Trade #%s demoted to tracking", fid)
+    return True
+
+
+async def rebalance_active_trades(use_futures: bool = True) -> list[str]:
+    """Rebalance active vs tracking trades based on proximity to current price.
+
+    For each symbol+side: if a tracking trade's entry is closer to price than
+    an active trade's entry, swap them (demote active, promote tracking).
+
+    Also: if we have unused risk budget and a tracking trade is close to price
+    (within PROMOTE_THRESHOLD_PCT), promote it directly.
+
+    Returns a list of actions taken (for reporting).
+    """
+    SWAP_ADVANTAGE_PCT = 1.0  # tracking must be at least 1% closer to justify swap
+    PROMOTE_THRESHOLD_PCT = 3.0  # auto-promote tracking trades within 3% of price
+
+    actions = []
+    all_trades = await supabase_client.get_open_trades()
+
+    if not all_trades:
+        return actions
+
+    # Separate active (has orders on Binance) vs tracking
+    active_trades = []
+    tracking_trades = []
+    for t in all_trades:
+        if t.get("source_channel") == "tracking":
+            tracking_trades.append(t)
+        else:
+            # Only consider unfilled active trades (no position yet)
+            has_filled = any(t.get(f"ep{i}_status") == "filled" for i in range(1, 4))
+            if has_filled:
+                continue  # Don't touch trades with open positions
+            active_trades.append(t)
+
+    if not tracking_trades:
+        return actions
+
+    # Get current prices for all relevant symbols
+    symbols = set()
+    for t in active_trades + tracking_trades:
+        symbols.add(t["symbol"])
+
+    prices = {}
+    for sym in symbols:
+        if use_futures:
+            p = await binance_client.futures_get_price(sym)
+        else:
+            p = await binance_client.get_price(sym)
+        if p:
+            prices[sym] = p
+
+    # Calculate distance for each trade
+    def get_distance(trade):
+        sym = trade["symbol"]
+        if sym not in prices:
+            return 999.0
+        price = prices[sym]
+        ep1 = float(trade.get("ep1", 0))
+        if ep1 <= 0:
+            return 999.0
+        return abs(price - ep1) / price * 100
+
+    # === PHASE 1: Swap — for each symbol+side, check if tracking beats active ===
+    for track in tracking_trades[:]:  # copy since we may modify
+        sym = track["symbol"]
+        side = track.get("side", "LONG")
+        track_dist = get_distance(track)
+
+        if track_dist >= 999:
+            continue
+
+        # Find active trades on same symbol+side
+        matching_active = [
+            a for a in active_trades
+            if a["symbol"] == sym and a.get("side") == side
+        ]
+
+        for act in matching_active:
+            act_dist = get_distance(act)
+            advantage = act_dist - track_dist
+
+            if advantage >= SWAP_ADVANTAGE_PCT:
+                logger.info(
+                    "REBALANCE: Swapping #%s %s %s (%.1f%% away) with tracking #%s %s (%.1f%% away) — %.1f%% closer",
+                    act["id"], sym, act.get("trader"), act_dist,
+                    track["id"], track.get("trader"), track_dist,
+                    advantage,
+                )
+
+                # Demote the active trade
+                cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
+                for ep in ("ep1", "ep2", "ep3"):
+                    oid = act.get(f"{ep}_id")
+                    if oid and act.get(f"{ep}_status") == "waiting":
+                        await cancel_fn(sym, int(oid))
+
+                await supabase_client.update_trade(act["id"], {
+                    "source_channel": "tracking",
+                    "risk_usdt": None, "r_multiplier": None, "rr_ratio": None,
+                    "ep1_id": None, "ep2_id": None, "ep3_id": None,
+                })
+
+                # Promote the tracking trade
+                promoted = await _promote_single_trade(track, sym, side, use_futures)
+                if promoted:
+                    actions.append(
+                        f"SWAP: demoted #{act['id']} {act.get('trader')} ({act_dist:.1f}%), "
+                        f"promoted #{track['id']} {track.get('trader')} ({track_dist:.1f}%)"
+                    )
+                    # Update our local lists
+                    active_trades.remove(act)
+                    tracking_trades.remove(track)
+                else:
+                    actions.append(
+                        f"SWAP PARTIAL: demoted #{act['id']} but failed to promote #{track['id']}"
+                    )
+                    active_trades.remove(act)
+                break  # one swap per tracking trade
+
+    # === PHASE 2: Promote — if risk budget allows, promote close tracking trades ===
+    for track in tracking_trades[:]:
+        track_dist = get_distance(track)
+        if track_dist > PROMOTE_THRESHOLD_PCT:
+            continue
+
+        sym = track["symbol"]
+        side = track.get("side", "LONG")
+
+        # Check if there's already an active trade on same symbol+side
+        has_active = any(
+            a["symbol"] == sym and a.get("side") == side
+            for a in active_trades
+        )
+        if has_active:
+            continue  # Already handled in phase 1 or already covered
+
+        # Try to promote within risk budget
+        promoted = await _promote_single_trade(track, sym, side, use_futures)
+        if promoted:
+            actions.append(
+                f"PROMOTE: #{track['id']} {sym} {side} {track.get('trader')} ({track_dist:.1f}% from price)"
+            )
+            tracking_trades.remove(track)
+
+    if not actions:
+        logger.info("REBALANCE: No changes needed")
+
+    return actions
+
+
+async def _promote_single_trade(trade: dict, symbol: str, side: str,
+                                  use_futures: bool) -> bool:
+    """Promote a single tracking trade to active. Returns True on success."""
+    ep1_price = trade.get("ep1")
+    ep2_price = trade.get("ep2")
+    sl_price = trade.get("sl")
+    trade_id = trade["id"]
+
+    if not ep1_price or not sl_price:
+        return False
+
+    avg_entry = float(ep1_price)
+    if ep2_price:
+        avg_entry = (float(ep1_price) + float(ep2_price)) / 2
+
+    risk = await risk_manager.assess_trade(
+        entry_price=avg_entry,
+        stop_loss=float(sl_price),
+        take_profit=None,
+        direction=side,
+        use_futures=use_futures,
+    )
+
+    if not risk.allowed:
+        logger.info("REBALANCE: Cannot promote #%s — %s", trade_id, risk.reason)
+        return False
+
+    if use_futures:
+        await binance_client.futures_setup_symbol(symbol, config.FUTURES_LEVERAGE, config.FUTURES_MARGIN_TYPE)
+
+    order_side = "SELL" if side == "SHORT" else "BUY"
+    total_crypto = risk.position_size_crypto
+
+    if ep2_price:
+        ep1_crypto = total_crypto * 0.5
+        ep2_crypto = total_crypto * 0.5
+    else:
+        ep1_crypto = total_crypto
+        ep2_crypto = 0
+
+    updates = {
+        "source_channel": "promoted",
+        "risk_usdt": risk.risk_capital,
+        "r_multiplier": risk.r_multiplier,
+        "rr_ratio": risk.rr_ratio if risk.rr_ratio > 0 else None,
+    }
+
+    if use_futures:
+        ep1_order = await binance_client.futures_place_limit_order(symbol, order_side, ep1_crypto, float(ep1_price))
+    else:
+        ep1_order = await binance_client.place_limit_order(symbol, order_side, ep1_crypto, float(ep1_price))
+
+    if not ep1_order:
+        logger.error("REBALANCE: Failed EP1 for #%s", trade_id)
+        return False
+
+    updates["ep1_id"] = str(ep1_order["orderId"])
+    updates["ep1_status"] = "filled" if ep1_order.get("status") == "FILLED" else "waiting"
+    updates["ep1_size_crypto"] = float(ep1_order.get("origQty", ep1_crypto))
+    updates["ep1_size_usdt"] = float(ep1_order.get("origQty", ep1_crypto)) * float(ep1_price)
+
+    if ep2_price and ep2_crypto > 0:
+        if use_futures:
+            ep2_order = await binance_client.futures_place_limit_order(symbol, order_side, ep2_crypto, float(ep2_price))
+        else:
+            ep2_order = await binance_client.place_limit_order(symbol, order_side, ep2_crypto, float(ep2_price))
+        if ep2_order:
+            updates["ep2_id"] = str(ep2_order["orderId"])
+            updates["ep2_status"] = "filled" if ep2_order.get("status") == "FILLED" else "waiting"
+            updates["ep2_size_crypto"] = float(ep2_order.get("origQty", ep2_crypto))
+            updates["ep2_size_usdt"] = float(ep2_order.get("origQty", ep2_crypto)) * float(ep2_price)
+
+    await supabase_client.update_trade(trade_id, updates)
+    logger.info(
+        "REBALANCE: Trade #%s promoted — %s %s %s risk=%.2f USDT",
+        trade_id, symbol, side, trade.get("trader", "?"), risk.risk_capital,
+    )
+    return True
