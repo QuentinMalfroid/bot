@@ -123,6 +123,31 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         logger.error("EXECUTOR: Cannot get price for %s", symbol)
         return
 
+    # --- Price normalization ---
+    # Traders sometimes write prices without decimals (e.g., "152" for $0.152)
+    # Detect and fix by comparing parsed prices to current market price
+    _prices = [p for p in [trade.entry_high, trade.entry_low, trade.stop_loss] if p]
+    if _prices and current_price:
+        _avg_parsed = sum(_prices) / len(_prices)
+        if _avg_parsed > 0:
+            _ratio = _avg_parsed / current_price
+            # If parsed prices are ~1000x the market price, divide by 1000
+            for factor in [10, 100, 1000, 10000]:
+                if 0.5 < (_ratio / factor) < 2.0:
+                    logger.info(
+                        "EXECUTOR: Price normalization for %s: parsed avg=%.4f market=%.4f -> dividing by %d",
+                        symbol, _avg_parsed, current_price, factor,
+                    )
+                    if trade.entry_high:
+                        trade.entry_high /= factor
+                    if trade.entry_low:
+                        trade.entry_low /= factor
+                    if trade.stop_loss:
+                        trade.stop_loss /= factor
+                    if trade.take_profit:
+                        trade.take_profit /= factor
+                    break
+
     # Determine entry prices
     # SHORT: price rises → hits entry_low first; LONG: price drops → hits entry_high first
     if trade.direction == "SHORT":
