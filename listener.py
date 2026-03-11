@@ -394,46 +394,81 @@ class TradeListener(discord.Client):
             if not desc:
                 continue
 
-            # Extract direction and asset from embed: ":Long: **BTC** | ..."
-            match = re.search(r":(Long|Short):\s*\*\*(\w+)\*\*", desc)
+            # Extract direction and asset — handle optional "LIMIT" prefix
+            # e.g. ":Long: **LIMIT** **BTC** | ..." or ":Long: **BTC** | ..."
+            match = re.search(
+                r":(Long|Short):\s*\*\*(?:LIMIT\s*\*\*\s*\*\*)?(\w+)\*\*", desc
+            )
             if not match:
                 continue
 
             direction = match.group(1).upper()
             asset = match.group(2).upper()
+            if asset == "LIMIT":
+                # Fallback: try to grab the asset after LIMIT
+                m2 = re.search(r":(Long|Short):\s*\*\*LIMIT\*\*\s*\*\*(\w+)\*\*", desc)
+                if m2:
+                    asset = m2.group(2).upper()
+                else:
+                    continue
             symbol = f"{asset}USDT" if not asset.endswith("USDT") else asset
 
             tp_info = trade_parser.parse_embed_tps(embed_dict)
             if not tp_info or not tp_info.prices:
                 continue
 
-            # Find the matching open trade in Supabase
-            # Try with common trader names
-            trades = await supabase_client.get_open_trades(symbol)
-            for trade in trades:
-                if trade.get("side") != direction:
-                    continue
+            # Extract entry prices from embed to identify the specific trade
+            # e.g. "**Entry:** 68200 − 67750" or "**Entry:** 70420 − 69000 (**AVG:** ...)"
+            entry_prices: list[float] = []
+            em = re.search(r"\*\*Entry:\*\*\s*([0-9.,\s−\-]+)", desc)
+            if em:
+                entry_prices = [
+                    float(p.replace(",", ""))
+                    for p in re.findall(r"[\d]+(?:\.\d+)?", em.group(1))
+                ]
 
-                trade_id = trade["id"]
-                tp_updates = {}
-                for i, (price, hit) in enumerate(zip(tp_info.prices, tp_info.hit)):
-                    tp_num = i + 1
-                    if tp_num > 6:
-                        break
-                    tp_key = f"tp{tp_num}"
-                    tp_updates[tp_key] = price
-                    current_status = trade.get(f"{tp_key}_status")
-                    if hit and current_status != "filled":
-                        tp_updates[f"{tp_key}_status"] = "filled"
-                    elif not hit and not current_status:
-                        tp_updates[f"{tp_key}_status"] = "waiting"
+            candidates = await supabase_client.get_open_trades(symbol)
+            candidates = [t for t in candidates if t.get("side") == direction]
+            if not candidates:
+                continue
 
-                if tp_updates:
-                    await supabase_client.update_trade(trade_id, tp_updates)
-                    logger.info(
-                        "TP_UPDATE: Trade #%s %s updated from edit: %s",
-                        trade_id, symbol, tp_updates,
-                    )
+            # Pick the trade whose EP prices best match the embed entry prices
+            def _entry_score(t: dict) -> float:
+                if not entry_prices:
+                    return 0.0
+                ep_prices = [
+                    float(t[f"ep{i}"])
+                    for i in (1, 2, 3)
+                    if t.get(f"ep{i}") is not None
+                ]
+                if not ep_prices:
+                    return float("inf")
+                return sum(
+                    min(abs(ep - p) for p in ep_prices) for ep in entry_prices
+                )
+
+            trade = min(candidates, key=_entry_score)
+            trade_id = trade["id"]
+
+            tp_updates = {}
+            for i, (price, hit) in enumerate(zip(tp_info.prices, tp_info.hit)):
+                tp_num = i + 1
+                if tp_num > 6:
+                    break
+                tp_key = f"tp{tp_num}"
+                tp_updates[tp_key] = price
+                current_status = trade.get(f"{tp_key}_status")
+                if hit and current_status != "filled":
+                    tp_updates[f"{tp_key}_status"] = "filled"
+                elif not hit and not current_status:
+                    tp_updates[f"{tp_key}_status"] = "waiting"
+
+            if tp_updates:
+                await supabase_client.update_trade(trade_id, tp_updates)
+                logger.info(
+                    "TP_UPDATE: Trade #%s %s updated from edit: %s",
+                    trade_id, symbol, tp_updates,
+                )
 
     async def _extract_tps_from_chart(self, message: discord.Message,
                                       embed_dict: dict, image_url: str):
