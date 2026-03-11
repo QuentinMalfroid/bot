@@ -267,6 +267,9 @@ class TradeListener(discord.Client):
             await self._process_alerts(message)
         elif channel_id in (config.TRADES_THREAD_ID, config.ACTIVE_SPOT_ID):
             await self._process_trade_signal(message, channel_name)
+            # Also check for TPs in embeds of new messages (not just edits)
+            if message.embeds:
+                await self._process_tp_update_from_edit(message)
 
         # 3. Telecharger les images
         for attachment in message.attachments:
