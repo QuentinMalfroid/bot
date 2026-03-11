@@ -114,7 +114,9 @@ async def main():
 
         # ── 4. PROCESS RECENT ALERTS (the critical missing piece!) ──
         for msg in discord_data.get("alerts", {}).get("recent", []):
-            content = resolve(msg.get("content", ""))
+            # Pass RAW content (with <@&id> mentions) to the parser —
+            # the parser expects role mention format, not resolved names
+            content = msg.get("content", "")
             if not content:
                 continue
 
@@ -702,7 +704,33 @@ async def main():
                         f"Trade #{t['id']} {t['symbol']} TPs updated: {tp_updates}"
                     )
 
-        # ── 9b. Place TP orders on Binance for trades with TPs but no orders ──
+        # ── 9b. Check if TP orders have been filled on Binance ──
+        for t in trades:
+            use_futures = "spot" not in (t.get("source_channel") or "").lower()
+            if not use_futures:
+                continue
+            for i in range(1, 7):
+                tp_id = t.get(f"tp{i}_id")
+                tp_status = t.get(f"tp{i}_status")
+                if tp_id and tp_status == "waiting":
+                    try:
+                        order = await binance_client.futures_get_order(
+                            t["symbol"], int(tp_id)
+                        )
+                        if order and order.get("status") == "FILLED":
+                            await supa_patch(t["id"], {f"tp{i}_status": "filled"})
+                            corrections.append(
+                                f"Trade #{t['id']} {t['symbol']} TP{i} filled on Binance"
+                            )
+                        elif order and order.get("status") in ("CANCELED", "EXPIRED"):
+                            await supa_patch(t["id"], {
+                                f"tp{i}_id": None,
+                                f"tp{i}_status": "waiting" if t.get(f"tp{i}") else None,
+                            })
+                    except Exception:
+                        pass
+
+        # ── 9c. Place TP orders on Binance for trades with TPs but no orders ──
         # Re-fetch trades to get updated TP values
         async with s.get(
             f"{SUPA_URL}/rest/v1/trades?status=eq.open&order=created_at.desc",
@@ -710,10 +738,29 @@ async def main():
         ) as r:
             trades = await r.json()
 
+        # Build map of existing reduce-only qty per symbol (from open orders)
+        existing_reduce_qty = {}
+        for t in trades:
+            symbol = t["symbol"]
+            for i in range(1, 7):
+                tp_id = t.get(f"tp{i}_id")
+                tp_status = t.get(f"tp{i}_status")
+                tp_price = t.get(f"tp{i}")
+                if tp_id and tp_status == "waiting" and tp_price:
+                    qty = 0.0
+                    # Estimate qty from trade's EP allocation
+                    ep_qty = sum(float(t.get(f"ep{e}_size_crypto") or 0) for e in (1,2,3) if t.get(f"ep{e}_status") == "filled")
+                    n_tps = sum(1 for j in range(1,7) if t.get(f"tp{j}") and t.get(f"tp{j}_status") == "waiting")
+                    if n_tps > 0:
+                        qty = ep_qty / n_tps
+                    existing_reduce_qty[symbol] = existing_reduce_qty.get(symbol, 0) + qty
+
         for t in trades:
             use_futures = "spot" not in (t.get("source_channel") or "").lower()
             if not use_futures:
                 continue
+
+            symbol = t["symbol"]
 
             # Check if trade has filled position
             total_qty = 0.0
@@ -737,8 +784,18 @@ async def main():
             if not tp_prices:
                 continue
 
+            # Check actual Binance position to avoid ReduceOnly rejection
+            pos = await binance_client.futures_get_position(symbol)
+            pos_qty = abs(float(pos.get("positionAmt", 0))) if pos else 0
+            already_allocated = existing_reduce_qty.get(symbol, 0)
+            available_for_tp = pos_qty - already_allocated
+            if available_for_tp <= 0:
+                continue
+
             tp_side = "SELL" if t.get("side") == "LONG" else "BUY"
             num_tps = len(tp_prices)
+            # Cap total_qty to available
+            total_qty = min(total_qty, available_for_tp)
 
             for idx, (tp_num, tp_price) in enumerate(tp_prices):
                 if idx < num_tps - 1:
@@ -746,12 +803,16 @@ async def main():
                 else:
                     tp_qty = round(total_qty - round(total_qty / num_tps, 8) * (num_tps - 1), 8)
 
+                if tp_qty <= 0:
+                    continue
+
                 tp_order = await binance_client.futures_place_tp_order(
                     t["symbol"], tp_side, tp_qty, tp_price,
                 )
                 if tp_order:
                     order_id = tp_order.get("orderId")
                     await supa_patch(t["id"], {f"tp{tp_num}_id": str(order_id)})
+                    existing_reduce_qty[symbol] = existing_reduce_qty.get(symbol, 0) + tp_qty
                     corrections.append(
                         f"Trade #{t['id']} {t['symbol']} TP{tp_num} placed @ {tp_price} qty={tp_qty} (orderId={order_id})"
                     )
