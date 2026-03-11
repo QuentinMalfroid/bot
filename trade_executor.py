@@ -471,9 +471,12 @@ async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAle
             await cancel_fn(symbol, order_id)
             logger.info("EXECUTOR: Cancelled %s order %s for trade #%s", ep, order_id, trade_id)
 
-    # Cancel SL order if exists
+    # Cancel SL order if exists (algo order for futures)
     if trade.get("sl_id") and trade.get("sl_status") == "waiting":
-        await cancel_fn(symbol, int(trade["sl_id"]))
+        if use_futures:
+            await binance_client.futures_cancel_algo_order(int(trade["sl_id"]))
+        else:
+            await binance_client.cancel_order(symbol, int(trade["sl_id"]))
         logger.info("EXECUTOR: Cancelled SL order for trade #%s", trade_id)
 
     realized_pnl = None
@@ -575,9 +578,12 @@ async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures:
     """Move stop-loss to breakeven (entry price). Also cancel unfilled EP orders."""
     cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
 
-    # Cancel existing SL order (if standard SL, not candle-based)
+    # Cancel existing SL order (algo order for futures)
     if trade.get("sl_id") and trade.get("sl_status") == "waiting":
-        await cancel_fn(symbol, int(trade["sl_id"]))
+        if use_futures:
+            await binance_client.futures_cancel_algo_order(int(trade["sl_id"]))
+        else:
+            await binance_client.cancel_order(symbol, int(trade["sl_id"]))
 
     # Cancel any unfilled EP limit orders (price moved up, don't want them filling later)
     for ep in ("ep1", "ep2", "ep3"):
@@ -643,10 +649,13 @@ async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures:
 async def _handle_sl_move(trade: dict, symbol: str, trade_id: int,
                            new_price: float, use_futures: bool):
     """Move stop-loss to a specific price."""
-    cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
 
+    # Cancel existing SL (algo order for futures)
     if trade.get("sl_id") and trade.get("sl_status") == "waiting":
-        await cancel_fn(symbol, int(trade["sl_id"]))
+        if use_futures:
+            await binance_client.futures_cancel_algo_order(int(trade["sl_id"]))
+        else:
+            await binance_client.cancel_order(symbol, int(trade["sl_id"]))
 
     total_qty = 0.0
     for ep in ("ep1", "ep2", "ep3"):
@@ -763,9 +772,11 @@ async def _handle_tp_hit(trade: dict, symbol: str, trade_id: int,
             # Update SL order quantity to match remaining position
             # (candle monitor handles this automatically since it reads position from Binance)
             if not candle_monitor.is_watched(trade_id) and trade.get("sl_id"):
-                # For standard SL: cancel and re-place with new qty
-                cancel_fn = binance_client.futures_cancel_order if use_futures else binance_client.cancel_order
-                await cancel_fn(symbol, int(trade["sl_id"]))
+                # For standard SL: cancel algo order and re-place with new qty
+                if use_futures:
+                    await binance_client.futures_cancel_algo_order(int(trade["sl_id"]))
+                else:
+                    await binance_client.cancel_order(symbol, int(trade["sl_id"]))
 
                 sl_price = trade.get("sl")
                 if sl_price:

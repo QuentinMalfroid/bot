@@ -144,23 +144,28 @@ async def main():
                         if not be_price:
                             continue
 
-                        # Cancel old SL on Binance
+                        # Cancel old SL on Binance (algo order for futures)
                         if existing.get("sl_id") and existing.get("sl_status") == "waiting":
                             try:
                                 if use_futures:
-                                    await binance_client.futures_cancel_order(symbol, int(existing["sl_id"]))
+                                    await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
                                 else:
                                     await binance_client.cancel_order(symbol, int(existing["sl_id"]))
                             except Exception as e:
                                 print(f"  Could not cancel old SL: {e}")
 
-                        # Calculate total filled qty
+                        # Use actual position size from Binance (more accurate)
                         total_qty = 0.0
-                        for ep in ("ep1", "ep2", "ep3"):
-                            if existing.get(f"{ep}_status") == "filled":
-                                qty = existing.get(f"{ep}_size_crypto")
-                                if qty:
-                                    total_qty += float(qty)
+                        if use_futures:
+                            pos = await binance_client.futures_get_position(symbol)
+                            if pos:
+                                total_qty = abs(float(pos.get("positionAmt", 0)))
+                        if total_qty <= 0:
+                            for ep in ("ep1", "ep2", "ep3"):
+                                if existing.get(f"{ep}_status") == "filled":
+                                    qty = existing.get(f"{ep}_size_crypto")
+                                    if qty:
+                                        total_qty += float(qty)
 
                         if total_qty > 0:
                             sl_side = "SELL" if side == "LONG" else "BUY"
@@ -197,18 +202,23 @@ async def main():
                         if existing.get("sl_id") and existing.get("sl_status") == "waiting":
                             try:
                                 if use_futures:
-                                    await binance_client.futures_cancel_order(symbol, int(existing["sl_id"]))
+                                    await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
                                 else:
                                     await binance_client.cancel_order(symbol, int(existing["sl_id"]))
                             except Exception as e:
                                 print(f"  Could not cancel old SL: {e}")
 
                         total_qty = 0.0
-                        for ep in ("ep1", "ep2", "ep3"):
-                            if existing.get(f"{ep}_status") == "filled":
-                                qty = existing.get(f"{ep}_size_crypto")
-                                if qty:
-                                    total_qty += float(qty)
+                        if use_futures:
+                            pos = await binance_client.futures_get_position(symbol)
+                            if pos:
+                                total_qty = abs(float(pos.get("positionAmt", 0)))
+                        if total_qty <= 0:
+                            for ep in ("ep1", "ep2", "ep3"):
+                                if existing.get(f"{ep}_status") == "filled":
+                                    qty = existing.get(f"{ep}_size_crypto")
+                                    if qty:
+                                        total_qty += float(qty)
 
                         if total_qty > 0:
                             sl_side = "SELL" if side == "LONG" else "BUY"
@@ -250,11 +260,11 @@ async def main():
                                 except Exception:
                                     pass
 
-                        # Cancel SL
+                        # Cancel SL (algo order for futures)
                         if existing.get("sl_id") and existing.get("sl_status") == "waiting":
                             try:
                                 if use_futures:
-                                    await binance_client.futures_cancel_order(symbol, int(existing["sl_id"]))
+                                    await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
                                 else:
                                     await binance_client.cancel_order(symbol, int(existing["sl_id"]))
                                 updates["sl_status"] = "cancelled"
@@ -308,22 +318,28 @@ async def main():
                         if "stops moved to be" in (alert.action or "").lower():
                             be_price = existing.get("ep1")
                             if be_price:
-                                # Cancel old SL and place new one at BE
+                                # Cancel old SL (algo order) and place new one at BE
                                 if existing.get("sl_id") and existing.get("sl_status") == "waiting":
                                     try:
                                         if use_futures:
-                                            await binance_client.futures_cancel_order(symbol, int(existing["sl_id"]))
+                                            await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
                                         else:
                                             await binance_client.cancel_order(symbol, int(existing["sl_id"]))
                                     except Exception:
                                         pass
 
+                                # Use actual position size from Binance
                                 total_qty = 0.0
-                                for ep in ("ep1", "ep2", "ep3"):
-                                    if existing.get(f"{ep}_status") == "filled":
-                                        qty = existing.get(f"{ep}_size_crypto")
-                                        if qty:
-                                            total_qty += float(qty)
+                                if use_futures:
+                                    pos = await binance_client.futures_get_position(symbol)
+                                    if pos:
+                                        total_qty = abs(float(pos.get("positionAmt", 0)))
+                                if total_qty <= 0:
+                                    for ep in ("ep1", "ep2", "ep3"):
+                                        if existing.get(f"{ep}_status") == "filled":
+                                            qty = existing.get(f"{ep}_size_crypto")
+                                            if qty:
+                                                total_qty += float(qty)
 
                                 if total_qty > 0:
                                     sl_side = "SELL" if side == "LONG" else "BUY"
