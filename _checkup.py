@@ -476,6 +476,40 @@ async def main():
                     )
             else:
                 print(f"  Binance {symbol}: no position")
+                # Detect orphan trades: EPs filled but position = 0 → trade was closed
+                for t in trades:
+                    if t["symbol"] != symbol or t.get("status") != "open":
+                        continue
+                    has_filled = any(
+                        t.get(f"{ep}_status") == "filled"
+                        for ep in ("ep1", "ep2", "ep3")
+                    )
+                    if not has_filled:
+                        continue
+                    # This trade has filled EPs but no position — it was closed
+                    # Cancel orphan SL if exists
+                    if t.get("sl_id"):
+                        try:
+                            import hmac as _hmac2, hashlib as _hl2, time as _t2
+                            _ts2 = str(int(_t2.time() * 1000))
+                            _ak2 = os.getenv("BINANCE_API_KEY")
+                            _as2 = os.getenv("BINANCE_SECRET_KEY")
+                            _p2 = f'algoId={t["sl_id"]}&timestamp={_ts2}'
+                            _sig2 = _hmac2.new(_as2.encode(), _p2.encode(), _hl2.sha256).hexdigest()
+                            await s.delete(
+                                f'https://testnet.binancefuture.com/fapi/v1/algoOrder?{_p2}&signature={_sig2}',
+                                headers={"X-MBX-APIKEY": _ak2},
+                            )
+                        except Exception:
+                            pass
+                    await supa_patch(t["id"], {
+                        "status": "closed",
+                        "close_reason": "profit",
+                        "sl_status": None,
+                    })
+                    corrections.append(
+                        f"Trade #{t['id']} {symbol} closed (position=0, EPs were filled)"
+                    )
 
         # ── 7. Check SL for filled positions — AUTO-PLACE if missing ──
         # Re-fetch trades since we may have updated them
