@@ -674,6 +674,12 @@ async def main():
                         f"Trade #{t['id']} {t['symbol']} TP{tp_num} placed @ {tp_price} qty={tp_qty} (orderId={order_id})"
                     )
 
+        # ── 9c. Rebalance: promote tracking trades close to price ──
+        import trade_executor as te
+        rebalance_actions = await te.rebalance_active_trades(use_futures=True)
+        for ra in rebalance_actions:
+            corrections.append(ra)
+
         # ── 10. Risk summary ──
         bal = await binance_client.futures_get_balance("USDT")
         tradeable = bal * 0.8

@@ -862,6 +862,20 @@ async def _promote_tracking_trade(symbol: str, side: str, use_futures: bool):
             await supabase_client.update_trade(trade_id, {"status": "closed", "close_reason": "invalidated"})
             return
 
+    # SAFETY: Block promotion if there's an open position in the opposite direction
+    if use_futures:
+        pos = await binance_client.futures_get_position(symbol)
+        if pos:
+            pos_amt = float(pos.get("positionAmt", 0))
+            if pos_amt != 0:
+                pos_side = "LONG" if pos_amt > 0 else "SHORT"
+                if pos_side != side:
+                    logger.warning(
+                        "EXECUTOR: Cannot promote #%s %s %s — opposite %s position exists (%.6f)",
+                        trade_id, symbol, side, pos_side, pos_amt,
+                    )
+                    return
+
     # Setup symbol on Binance
     if use_futures:
         await binance_client.futures_setup_symbol(symbol, config.FUTURES_LEVERAGE, config.FUTURES_MARGIN_TYPE)
@@ -981,6 +995,20 @@ async def _promote_tracking_on_fill(trade: dict, symbol: str, trade_id: int,
     if not ep1_price or not sl_price:
         logger.warning("EXECUTOR: Cannot promote #%s — missing EP1 or SL", trade_id)
         return
+
+    # SAFETY: Block promotion if there's an open position in the opposite direction
+    if use_futures:
+        pos = await binance_client.futures_get_position(symbol)
+        if pos:
+            pos_amt = float(pos.get("positionAmt", 0))
+            if pos_amt != 0:
+                pos_side = "LONG" if pos_amt > 0 else "SHORT"
+                if pos_side != side:
+                    logger.warning(
+                        "EXECUTOR: Cannot promote #%s %s %s — opposite %s position exists (%.6f)",
+                        trade_id, symbol, side, pos_side, pos_amt,
+                    )
+                    return
 
     # Check if risk allows promotion; if not, try to free up by demoting furthest trade
     avg_entry = float(ep1_price)
@@ -1341,6 +1369,21 @@ async def _promote_single_trade(trade: dict, symbol: str, side: str,
 
     if not ep1_price or not sl_price:
         return False
+
+    # SAFETY: Block promotion if there's an open position on this symbol
+    # in the OPPOSITE direction — placing orders would close/flip the position
+    if use_futures:
+        pos = await binance_client.futures_get_position(symbol)
+        if pos:
+            pos_amt = float(pos.get("positionAmt", 0))
+            if pos_amt != 0:
+                pos_side = "LONG" if pos_amt > 0 else "SHORT"
+                if pos_side != side:
+                    logger.warning(
+                        "REBALANCE: Cannot promote #%s %s %s — opposite %s position exists (%.6f)",
+                        trade_id, symbol, side, pos_side, pos_amt,
+                    )
+                    return False
 
     avg_entry = float(ep1_price)
     if ep2_price:
