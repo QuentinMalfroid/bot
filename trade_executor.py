@@ -583,6 +583,64 @@ async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAle
     # Check if a tracking trade on the same symbol can now be promoted
     await _promote_tracking_trade(symbol, trade.get("side", "LONG"), use_futures)
 
+    # Also check ALL waiting trades (any symbol) that have no Binance orders yet.
+    # These are trades saved from Discord but never promoted because risk was full.
+    await _promote_any_waiting_trade(use_futures)
+
+
+async def _promote_any_waiting_trade(use_futures: bool):
+    """After a trade closes, find open trades with no Binance orders yet and
+    promote the one closest to the current price (risk manager may block the rest)."""
+    session = await supabase_client._get_session()
+    url = (
+        f"{supabase_client._BASE_URL}/trades"
+        f"?status=eq.open&ep1_status=eq.waiting&ep1_id=is.null"
+        f"&order=created_at.asc"
+    )
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return
+            candidates = await resp.json()
+    except Exception:
+        return
+
+    if not candidates:
+        return
+
+    # Fetch current prices and sort by distance to EP1 (closest first)
+    prices: dict[str, float] = {}
+    for t in candidates:
+        sym = t["symbol"]
+        if sym not in prices:
+            p = await (binance_client.futures_get_price(sym) if use_futures
+                       else binance_client.get_price(sym))
+            if p:
+                prices[sym] = p
+
+    def _dist(t: dict) -> float:
+        p = prices.get(t["symbol"])
+        ep = t.get("ep1")
+        if not p or not ep:
+            return float("inf")
+        return abs(p - float(ep)) / float(ep)
+
+    candidates.sort(key=_dist)
+
+    for trade in candidates:
+        sym = trade["symbol"]
+        side = trade.get("side", "LONG")
+        if sym not in prices:
+            continue
+        promoted = await _promote_single_trade(trade, sym, side, use_futures)
+        if promoted:
+            logger.info(
+                "REBALANCE: Auto-promoted waiting trade #%s %s %s %s after close",
+                trade["id"], sym, side, trade.get("trader", "?"),
+            )
+            # Attempt to promote one more (risk manager caps the rest naturally)
+            # — continue loop; subsequent calls will be blocked by risk if budget full
+
 
 async def _handle_sl_to_be(trade: dict, symbol: str, trade_id: int, use_futures: bool):
     """Move stop-loss to breakeven (entry price). Also cancel unfilled EP orders."""
