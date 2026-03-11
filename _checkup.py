@@ -154,6 +154,22 @@ async def main():
                             except Exception as e:
                                 print(f"  Could not cancel old SL: {e}")
 
+                        # Cancel unfilled EP orders (price moved past entry, don't want them filling later)
+                        for ep in ("ep1", "ep2", "ep3"):
+                            oid = existing.get(f"{ep}_id")
+                            if oid and existing.get(f"{ep}_status") == "waiting":
+                                try:
+                                    if use_futures:
+                                        await binance_client.futures_cancel_order(symbol, int(oid))
+                                    else:
+                                        await binance_client.cancel_order(symbol, int(oid))
+                                    await supa_patch(trade_id, {f"{ep}_status": None, f"{ep}_id": None})
+                                    corrections.append(
+                                        f"Trade #{trade_id} {symbol} {ep} cancelled (SL→BE)"
+                                    )
+                                except Exception as e:
+                                    print(f"  Could not cancel {ep}: {e}")
+
                         # Use actual position size from Binance (more accurate)
                         total_qty = 0.0
                         if use_futures:
@@ -327,6 +343,22 @@ async def main():
                                             await binance_client.cancel_order(symbol, int(existing["sl_id"]))
                                     except Exception:
                                         pass
+
+                                # Cancel unfilled EP orders
+                                for ep in ("ep1", "ep2", "ep3"):
+                                    oid = existing.get(f"{ep}_id")
+                                    if oid and existing.get(f"{ep}_status") == "waiting":
+                                        try:
+                                            if use_futures:
+                                                await binance_client.futures_cancel_order(symbol, int(oid))
+                                            else:
+                                                await binance_client.cancel_order(symbol, int(oid))
+                                            await supa_patch(trade_id, {f"{ep}_status": None, f"{ep}_id": None})
+                                            corrections.append(
+                                                f"Trade #{trade_id} {symbol} {ep} cancelled (TP+BE)"
+                                            )
+                                        except Exception:
+                                            pass
 
                                 # Use actual position size from Binance
                                 total_qty = 0.0
