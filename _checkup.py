@@ -293,7 +293,7 @@ async def main():
                             amt = abs(float(pos["positionAmt"]))
                             close_side = "SELL" if float(pos["positionAmt"]) > 0 else "BUY"
                             if use_futures:
-                                await binance_client.futures_place_market_order(symbol, close_side, amt)
+                                await binance_client.futures_place_market_order(symbol, close_side, amt, reduce_only=True)
                             corrections.append(
                                 f"Trade #{trade_id} {symbol} position closed on Binance"
                             )

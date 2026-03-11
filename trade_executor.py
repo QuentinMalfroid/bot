@@ -497,9 +497,19 @@ async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAle
             if position:
                 pos_amt = abs(float(position.get("positionAmt", 0)))
                 close_qty = min(trade_qty, pos_amt)
+                # If remaining would be dust (< min_qty), close entire position
+                sym_info = await binance_client.futures_get_symbol_info(symbol)
+                if sym_info:
+                    for f in sym_info.get("filters", []):
+                        if f["filterType"] == "LOT_SIZE":
+                            min_qty = float(f.get("minQty", 0))
+                            remaining = pos_amt - close_qty
+                            if 0 < remaining < min_qty:
+                                close_qty = pos_amt
+                            break
                 if close_qty > 0:
                     close_side = "BUY" if trade.get("side") == "SHORT" else "SELL"
-                    close_result = await binance_client.futures_place_market_order(symbol, close_side, close_qty)
+                    close_result = await binance_client.futures_place_market_order(symbol, close_side, close_qty, reduce_only=True)
                     if close_result:
                         # Estimate P&L from trade data
                         avg_entry = 0.0
@@ -732,15 +742,21 @@ async def _handle_tp_hit(trade: dict, symbol: str, trade_id: int,
     else:
         sym_info = await binance_client.get_symbol_info(symbol)
 
+    min_qty = 0.0
     if sym_info:
         # Round to symbol's step size
         step_size = None
         for f in sym_info.get("filters", []):
             if f["filterType"] == "LOT_SIZE":
                 step_size = float(f["stepSize"])
+                min_qty = float(f.get("minQty", 0))
                 break
         if step_size and step_size > 0:
             close_qty = int(close_qty / step_size) * step_size
+            # If remaining would be below min_qty, close the entire position
+            remaining = pos_qty - close_qty
+            if 0 < remaining < min_qty:
+                close_qty = pos_qty
 
     if close_qty <= 0:
         logger.info("EXECUTOR: TP%s close qty too small for trade #%s", tp_level, trade_id)
@@ -749,7 +765,7 @@ async def _handle_tp_hit(trade: dict, symbol: str, trade_id: int,
     close_side = "SELL" if trade.get("side") == "LONG" else "BUY"
 
     if use_futures:
-        result = await binance_client.futures_place_market_order(symbol, close_side, close_qty)
+        result = await binance_client.futures_place_market_order(symbol, close_side, close_qty, reduce_only=True)
     else:
         result = await binance_client.place_market_order(symbol, close_side, quantity=close_qty)
 

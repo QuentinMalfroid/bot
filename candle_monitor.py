@@ -260,9 +260,21 @@ async def _execute_candle_sl(trade_id: int):
     # Close position with market order (only our trade's quantity)
     pos_amt = abs(float(position["positionAmt"]))
     close_qty = min(total_qty, pos_amt)
+
+    # If remaining would be dust (< min_qty), close entire position
+    sym_info = await binance_client.futures_get_symbol_info(watch.symbol)
+    if sym_info:
+        for f in sym_info.get("filters", []):
+            if f["filterType"] == "LOT_SIZE":
+                min_qty = float(f.get("minQty", 0))
+                remaining = pos_amt - close_qty
+                if 0 < remaining < min_qty:
+                    close_qty = pos_amt
+                break
+
     close_side = "SELL" if watch.side == "LONG" else "BUY"
 
-    result = await binance_client.futures_place_market_order(watch.symbol, close_side, close_qty)
+    result = await binance_client.futures_place_market_order(watch.symbol, close_side, close_qty, reduce_only=True)
 
     if result:
         # Calculate P&L

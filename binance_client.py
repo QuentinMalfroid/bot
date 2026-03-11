@@ -189,15 +189,22 @@ async def futures_place_market_order(
     symbol: str,
     side: str,
     quantity: float,
+    reduce_only: bool = False,
 ) -> Optional[dict]:
-    """Place a futures MARKET order."""
+    """Place a futures MARKET order.
+
+    Args:
+        reduce_only: If True, order can only reduce an existing position.
+                     Bypasses minimum notional check on Binance.
+    """
     symbol_info = await futures_get_symbol_info(symbol)
     if symbol_info:
         lot = _get_lot_size(symbol_info)
         quantity = _round_step(quantity, lot["step_size"])
         if quantity < lot["min_qty"]:
-            logger.error("Quantity %s below min %s for %s", quantity, lot["min_qty"], symbol)
-            return None
+            if not reduce_only:
+                logger.error("Quantity %s below min %s for %s", quantity, lot["min_qty"], symbol)
+                return None
 
     params = {
         "symbol": symbol,
@@ -205,6 +212,8 @@ async def futures_place_market_order(
         "type": "MARKET",
         "quantity": f"{quantity}",
     }
+    if reduce_only:
+        params["reduceOnly"] = "true"
     result = await _request("POST", "/fapi/v1/order", params, base_url=FUTURES_BASE)
     if result:
         logger.info(
