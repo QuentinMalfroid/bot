@@ -330,8 +330,13 @@ async def main():
 
                     # ── TP hit ──
                     elif alert.event_type == "tp_hit" and alert.tp_level:
-                        tp_key = f"tp{alert.tp_level}_status"
-                        updates = {tp_key: "filled"}
+                        tp_key = f"tp{alert.tp_level}"
+                        # Skip if TP price doesn't exist in Supabase
+                        if not existing.get(tp_key):
+                            print(f"  SKIP TP{alert.tp_level} hit for #{trade_id} {symbol}: no {tp_key} price in DB")
+                            continue
+                        tp_status_key = f"tp{alert.tp_level}_status"
+                        updates = {tp_status_key: "filled"}
                         # If combined with "stops moved to be"
                         if "stops moved to be" in (alert.action or "").lower():
                             be_price = existing.get("ep1")
