@@ -309,7 +309,9 @@ class TradeListener(discord.Client):
 
     async def _process_alerts(self, message: discord.Message):
         """Parse les alertes active-alerts, met a jour Supabase et gere les ordres Binance."""
-        content = self._resolve_roles(message.content) if message.content else ""
+        # Pass raw content so the parser can match <@&role_id> mentions via _ROLE_TO_TRADER.
+        # Resolving roles first breaks the new-format regex and causes all alerts to be ignored.
+        content = message.content or ""
         alerts = trade_parser.parse_alert_message(content)
         if not alerts:
             return
