@@ -79,8 +79,13 @@ async def execute_trade_signal(trade: TradeSignal, channel_name: str, message_id
         logger.warning("EXECUTOR: Symbol %s not trading (status=%s)", symbol, sym_info.get("status"))
         return
 
-    # ONE TRADE PER SYMBOL: if another trade is already open, track without placing orders
-    if await supabase_client.has_open_trade_on_symbol(symbol, trade.direction):
+    # ONE TRADE PER SYMBOL: if another trade is already open (same OR opposite direction),
+    # track without placing orders. Opposite-direction trades would offset the position
+    # on a one-way Binance account, creating conflicting P&L.
+    opposite = "SHORT" if trade.direction == "LONG" else "LONG"
+    has_same = await supabase_client.has_open_trade_on_symbol(symbol, trade.direction)
+    has_opposite = await supabase_client.has_open_trade_on_symbol(symbol, opposite)
+    if has_same or has_opposite:
         # Still insert into Supabase for tracking/analytics (no Binance orders)
         tracking_row = {
             "symbol": symbol,
