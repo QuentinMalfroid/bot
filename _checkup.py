@@ -494,6 +494,19 @@ async def main():
                     if not has_filled:
                         continue
                     # This trade has filled EPs but no position — it was closed
+                    use_futures_o = "spot" not in (t.get("source_channel") or "").lower()
+                    cancel_fn_o = binance_client.futures_cancel_order if use_futures_o else binance_client.cancel_order
+                    # Cancel orphan EP2/EP3 waiting orders
+                    for ep_o in ("ep1", "ep2", "ep3"):
+                        oid_o = t.get(f"{ep_o}_id")
+                        if oid_o and t.get(f"{ep_o}_status") == "waiting":
+                            try:
+                                await cancel_fn_o(symbol, int(oid_o))
+                                corrections.append(
+                                    f"Trade #{t['id']} {symbol} {ep_o} order cancelled (orphan)"
+                                )
+                            except Exception:
+                                pass
                     # Cancel orphan SL if exists
                     if t.get("sl_id"):
                         try:
@@ -678,13 +691,40 @@ async def main():
                 matched_trade = msg_id_to_trade.get(msg["id"])
 
                 if not matched_trade:
-                    # Fallback: check if this embed is an edit/update of an
-                    # existing trade message (same message_id as a trade)
-                    # Also check referenced messages
+                    # Fallback 1: referenced message_id (embed posted as reply)
                     ref = msg.get("message_reference", {})
                     ref_id = ref.get("message_id")
                     if ref_id:
                         matched_trade = msg_id_to_trade.get(str(ref_id))
+
+                if not matched_trade:
+                    # Fallback 2: match by symbol + side + entry price
+                    # (handles case where embed posted BEFORE user message)
+                    embed_side = dir_match.group(1).upper()  # "LONG" or "SHORT"
+                    embed_sym = dir_match.group(2).upper()   # e.g. "SOL", "ETH"
+                    ep_match = re.search(r"\*\*Entry:\*\*\s*([\d.]+)", desc)
+                    embed_ep1 = float(ep_match.group(1)) if ep_match else None
+                    for t_cand in trades:
+                        if t_cand.get("status") != "open":
+                            continue
+                        if not t_cand.get("symbol", "").upper().startswith(embed_sym):
+                            continue
+                        if t_cand.get("side", "").upper() != embed_side:
+                            continue
+                        if embed_ep1 and t_cand.get("ep1"):
+                            try:
+                                if abs(float(t_cand["ep1"]) - embed_ep1) < 0.01:
+                                    matched_trade = t_cand
+                                    break
+                            except (TypeError, ValueError):
+                                pass
+                        else:
+                            # No EP1 to compare — just symbol+side match if unique
+                            if not matched_trade:
+                                matched_trade = t_cand
+                            else:
+                                matched_trade = None  # ambiguous, skip
+                                break
 
                 if not matched_trade:
                     continue
