@@ -587,7 +587,11 @@ async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAle
     )
 
     # Check if a tracking trade on the same symbol can now be promoted
-    await _promote_tracking_trade(symbol, trade.get("side", "LONG"), use_futures)
+    closed_side = trade.get("side", "LONG")
+    await _promote_tracking_trade(symbol, closed_side, use_futures)
+    # Also promote opposite-side tracking trades now that the blocking position is gone
+    opposite_side = "SHORT" if closed_side == "LONG" else "LONG"
+    await _promote_tracking_trade(symbol, opposite_side, use_futures)
 
     # Also check ALL waiting trades (any symbol) that have no Binance orders yet.
     # These are trades saved from Discord but never promoted because risk was full.
