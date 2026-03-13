@@ -823,16 +823,17 @@ async def main():
                         entry_ref = float(t.get("ep1") or 0)
                         side = t.get("side", "").upper()
                         # Validate: SHORT TPs must be below entry, LONG TPs must be above
+                        # Also plausibility check: TP must be within 50% of entry (rejects BTC prices on ETH charts)
                         valid_tps = []
                         for price in analysis.take_profits[:6]:
                             p = float(price)
                             if entry_ref <= 0:
                                 valid_tps.append(p)  # no entry to compare, accept
-                            elif side == "SHORT" and p < entry_ref:
-                                valid_tps.append(p)
-                            elif side == "LONG" and p > entry_ref:
-                                valid_tps.append(p)
-                            # else: wrong direction, skip this TP
+                            else:
+                                direction_ok = (side == "SHORT" and p < entry_ref) or (side == "LONG" and p > entry_ref)
+                                plausibility_ok = abs(p - entry_ref) / entry_ref < 0.5
+                                if direction_ok and plausibility_ok:
+                                    valid_tps.append(p)
                         if not valid_tps:
                             print(f"    -> GPT returned TPs but all failed direction validation (entry={entry_ref} side={side}): {analysis.take_profits[:6]}")
                         else:
