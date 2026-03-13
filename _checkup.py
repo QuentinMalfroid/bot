@@ -749,6 +749,107 @@ async def main():
                         f"Trade #{t['id']} {t['symbol']} TPs updated: {tp_updates}"
                     )
 
+        # ── 9d. GPT-4o chart analysis for trades with no TPs ──
+        # For trades that still have no TP after text parsing, try reading the chart image
+        import chart_analyzer
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if openai_key:
+            # Build map of WG Bot messages with images from the trades channel
+            # msg_id -> image_url
+            wgbot_images = {}
+            for msg in discord_data.get("trades", {}).get("all", []):
+                if msg["author"]["username"] != "WG Bot":
+                    continue
+                for embed in msg.get("embeds", []):
+                    img = embed.get("image", {})
+                    img_url = img.get("url") if img else None
+                    if img_url:
+                        wgbot_images[msg["id"]] = {"url": img_url, "desc": embed.get("description", "")}
+
+            for t in trades:
+                # Skip if already has TPs
+                if any(t.get(f"tp{i}") for i in range(1, 7)):
+                    continue
+                # Only process trades with filled EPs (active position)
+                has_filled = any(t.get(f"ep{ep}_status") == "filled" for ep in (1, 2, 3))
+                if not has_filled:
+                    continue
+
+                # Find the WG Bot embed with image for this trade
+                # Strategy: look at messages around the trade's discord_message_id
+                img_url = None
+                embed_desc = ""
+                msg_id = t.get("discord_message_id")
+                if msg_id:
+                    # First check already-loaded messages
+                    for wg_msg_id, data in wgbot_images.items():
+                        # Pick the WG Bot message closest (within ~5 msgs) to the trade msg
+                        if abs(int(wg_msg_id) - int(msg_id)) < 500000000000:  # ~few seconds apart
+                            desc = data["desc"]
+                            sym = t.get("symbol", "").replace("USDT", "")
+                            side = t.get("side", "").upper()
+                            if sym.upper() in desc.upper() and side[:4] in desc:
+                                img_url = data["url"]
+                                embed_desc = desc
+                                break
+
+                    # If not found in loaded messages, fetch from API
+                    if not img_url:
+                        ch_id = CHANNELS["trades"]
+                        url = f"https://discord.com/api/v9/channels/{ch_id}/messages?around={msg_id}&limit=5"
+                        async with s.get(url, headers=headers) as r:
+                            nearby = await r.json() if r.status == 200 else []
+                        for nm in nearby if isinstance(nearby, list) else []:
+                            if nm.get("author", {}).get("username") != "WG Bot":
+                                continue
+                            for embed in nm.get("embeds", []):
+                                eimg = embed.get("image", {})
+                                eurl = eimg.get("url") if eimg else None
+                                if eurl:
+                                    img_url = eurl
+                                    embed_desc = embed.get("description", "")
+                                    break
+                            if img_url:
+                                break
+
+                if not img_url:
+                    continue
+
+                # Analyze the chart with GPT-4o
+                print(f"  GPT-4o analyzing chart for trade #{t['id']} {t['symbol']} {t.get('side')}...")
+                try:
+                    analysis = await chart_analyzer.analyze_chart_image(image_url=img_url)
+                    if analysis and analysis.take_profits:
+                        entry_ref = float(t.get("ep1") or 0)
+                        side = t.get("side", "").upper()
+                        # Validate: SHORT TPs must be below entry, LONG TPs must be above
+                        valid_tps = []
+                        for price in analysis.take_profits[:6]:
+                            p = float(price)
+                            if entry_ref <= 0:
+                                valid_tps.append(p)  # no entry to compare, accept
+                            elif side == "SHORT" and p < entry_ref:
+                                valid_tps.append(p)
+                            elif side == "LONG" and p > entry_ref:
+                                valid_tps.append(p)
+                            # else: wrong direction, skip this TP
+                        if not valid_tps:
+                            print(f"    -> GPT returned TPs but all failed direction validation (entry={entry_ref} side={side}): {analysis.take_profits[:6]}")
+                        else:
+                            tp_updates = {}
+                            for i, price in enumerate(valid_tps):
+                                tp_updates[f"tp{i+1}"] = price
+                                tp_updates[f"tp{i+1}_status"] = "waiting"
+                            await supa_patch(t["id"], tp_updates)
+                            corrections.append(
+                                f"Trade #{t['id']} {t['symbol']} TPs from chart (GPT-4o): {[f'TP{i+1}={p}' for i, p in enumerate(valid_tps)]}"
+                            )
+                            print(f"    -> TPs validated & saved: {valid_tps}")
+                    else:
+                        print(f"    -> GPT could not extract TPs from chart")
+                except Exception as e:
+                    print(f"    -> GPT chart error: {e}")
+
         # ── 9b. Check if TP orders have been filled on Binance ──
         for t in trades:
             use_futures = "spot" not in (t.get("source_channel") or "").lower()
