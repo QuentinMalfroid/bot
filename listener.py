@@ -371,6 +371,13 @@ class TradeListener(discord.Client):
                     updates["ep1_status"] = "filled"
 
                 result = await supabase_client.update_trade(trade_id, updates)
+
+                # When entry is updated, also check if SL changed in the linked embed
+                if alert.event_type == "entry_updated" and alert.linked_message_id and alert.linked_channel_id:
+                    await self._fetch_and_update_sl_from_embed(
+                        alert.linked_channel_id, alert.linked_message_id,
+                        trade_id, existing,
+                    )
                 if result:
                     logger.info(
                         "ALERT: Trade #%s mis a jour - %s %s %s -> %s",
@@ -595,6 +602,58 @@ class TradeListener(discord.Client):
 
         except Exception as e:
             logger.error("TP_ORDERS: Error placing TP orders for trade #%s: %s", trade["id"], e)
+
+    async def _fetch_and_update_sl_from_embed(self, channel_id: str, message_id: str,
+                                              trade_id: int, existing: dict):
+        """When entry_updated alert arrives, fetch linked embed and update SL if it changed."""
+        try:
+            channel = self.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.fetch_channel(int(channel_id))
+            if channel is None:
+                return
+
+            async for msg in channel.history(around=discord.Object(id=int(message_id)), limit=5):
+                if str(msg.id) == message_id:
+                    for embed in msg.embeds:
+                        desc = embed.description or ""
+                        sl_match = re.search(r'\*\*SL:\*\*\s*([\d.]+)', desc)
+                        if not sl_match:
+                            continue
+                        new_sl = float(sl_match.group(1))
+                        old_sl = float(existing.get("sl") or 0)
+                        if new_sl == old_sl:
+                            continue
+                        # SL changed — update Supabase
+                        await supabase_client.update_trade(trade_id, {"sl": new_sl})
+                        logger.info(
+                            "ALERT: SL updated for trade #%s from linked embed: %s -> %s",
+                            trade_id, old_sl, new_sl,
+                        )
+                        # Cancel existing SL algo order if active
+                        if existing.get("sl_id") and existing.get("sl_status") != "filled":
+                            await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
+                        # Place new SL order if position exists
+                        pos = await binance_client.futures_get_position(existing["symbol"])
+                        if pos and float(pos.get("positionAmt", 0)) != 0:
+                            qty = abs(float(pos["positionAmt"]))
+                            sl_side = "BUY" if existing["side"] == "SHORT" else "SELL"
+                            result = await binance_client.futures_place_stop_loss_order(
+                                existing["symbol"], sl_side, qty, new_sl,
+                            )
+                            if result:
+                                algo_id = result.get("algoId") or result.get("orderId")
+                                await supabase_client.update_trade(trade_id, {
+                                    "sl_id": str(algo_id),
+                                    "sl_status": "waiting",
+                                })
+                                logger.info(
+                                    "ALERT: New SL placed for trade #%s @ %s algoId=%s",
+                                    trade_id, new_sl, algo_id,
+                                )
+                    return
+        except Exception as e:
+            logger.warning("ALERT: Could not fetch SL from embed %s: %s", message_id, e)
 
     async def _fetch_and_update_tps(self, channel_id: str, message_id: str,
                                      trade_id: int, existing: dict):
