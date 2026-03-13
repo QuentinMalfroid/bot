@@ -477,7 +477,8 @@ async def _handle_close(trade: dict, symbol: str, trade_id: int, alert: TradeAle
             logger.info("EXECUTOR: Cancelled %s order %s for trade #%s", ep, order_id, trade_id)
 
     # Cancel SL order if exists (algo order for futures)
-    if trade.get("sl_id") and trade.get("sl_status") == "waiting":
+    # Cancel regardless of sl_status — could be None after SL moved to BE
+    if trade.get("sl_id") and trade.get("sl_status") != "filled":
         if use_futures:
             await binance_client.futures_cancel_algo_order(int(trade["sl_id"]))
         else:

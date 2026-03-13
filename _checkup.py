@@ -147,7 +147,7 @@ async def main():
                             continue
 
                         # Cancel old SL on Binance (algo order for futures)
-                        if existing.get("sl_id") and existing.get("sl_status") == "waiting":
+                        if existing.get("sl_id") and existing.get("sl_status") != "filled":
                             try:
                                 if use_futures:
                                     await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
@@ -217,7 +217,7 @@ async def main():
 
                     # ── SL moved to specific price ──
                     elif alert.event_type == "sl_moved" and alert.new_sl_price:
-                        if existing.get("sl_id") and existing.get("sl_status") == "waiting":
+                        if existing.get("sl_id") and existing.get("sl_status") != "filled":
                             try:
                                 if use_futures:
                                     await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
@@ -279,7 +279,7 @@ async def main():
                                     pass
 
                         # Cancel SL (algo order for futures)
-                        if existing.get("sl_id") and existing.get("sl_status") == "waiting":
+                        if existing.get("sl_id") and existing.get("sl_status") != "filled":
                             try:
                                 if use_futures:
                                     await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
@@ -342,7 +342,7 @@ async def main():
                             be_price = existing.get("ep1")
                             if be_price:
                                 # Cancel old SL (algo order) and place new one at BE
-                                if existing.get("sl_id") and existing.get("sl_status") == "waiting":
+                                if existing.get("sl_id") and existing.get("sl_status") != "filled":
                                     try:
                                         if use_futures:
                                             await binance_client.futures_cancel_algo_order(int(existing["sl_id"]))
