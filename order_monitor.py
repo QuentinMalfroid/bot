@@ -118,12 +118,12 @@ async def _sync_trade(trade: dict):
                 ep.upper(), trade_id, symbol, filled_qty,
             )
 
-    # Check SL order status
+    # Check SL order status (SL orders are algo/conditional orders)
     sl_id = trade.get("sl_id")
     sl_status = trade.get("sl_status")
     if sl_id and sl_status == "waiting":
         if use_futures:
-            sl_order = await binance_client.futures_get_order(symbol, int(sl_id))
+            sl_order = await binance_client.futures_get_algo_order(int(sl_id))
         else:
             sl_order = await binance_client.get_order(symbol, int(sl_id))
 

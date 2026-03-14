@@ -402,16 +402,34 @@ async def futures_setup_symbol(symbol: str, leverage: int, margin_type: str = "I
 
 
 async def futures_get_order(symbol: str, order_id: int) -> Optional[dict]:
-    """Get a specific futures order by ID.
-
-    For algo orders (STOP_MARKET placed via algoOrder API), the testnet doesn't
-    support reading them back. We return None silently (no error log) so that
-    order_monitor can fall back to position-based SL detection.
-    """
+    """Get a specific futures order by ID (standard orders only, not algo)."""
     return await _request("GET", "/fapi/v1/order", {
         "symbol": symbol,
         "orderId": order_id,
     }, base_url=FUTURES_BASE)
+
+
+async def futures_get_algo_order(algo_id: int) -> Optional[dict]:
+    """Get a specific futures algo/conditional order by algoId.
+
+    Returns dict with algoStatus (NEW, TRIGGERED, CANCELLED, etc.)
+    and maps it to standard order fields for compatibility.
+    """
+    result = await _request("GET", "/fapi/v1/algoOrder", {
+        "algoId": algo_id,
+    }, base_url=FUTURES_BASE)
+    if result:
+        # Map algo fields to standard order fields for compatibility
+        algo_status = result.get("algoStatus", "")
+        if algo_status == "TRIGGERED":
+            result["status"] = "FILLED"
+        elif algo_status == "CANCELLED":
+            result["status"] = "CANCELED"
+        elif algo_status == "NEW":
+            result["status"] = "NEW"
+        else:
+            result["status"] = algo_status
+    return result
 
 
 # ============================================================
